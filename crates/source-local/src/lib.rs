@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -7,7 +8,8 @@ use anyhow::Result;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::Accessor;
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+pub use notify::RecommendedWatcher;
+use notify::{Event, RecursiveMode, Watcher};
 use rust_audio_core::{Database, ScanStatus, Track, TrackSource};
 use tokio::sync::watch;
 use walkdir::{DirEntry, WalkDir};
@@ -182,10 +184,36 @@ pub fn scan_directory_sync(
     db: &Arc<Mutex<Database>>,
     status_tx: Option<&watch::Sender<ScanStatus>>,
 ) -> Result<usize> {
+    let (indexed, _) = scan_directory_incremental(root, db, status_tx)?;
+    Ok(indexed)
+}
+
+pub fn scan_directory_incremental(
+    root: &Path,
+    db: &Arc<Mutex<Database>>,
+    status_tx: Option<&watch::Sender<ScanStatus>>,
+) -> Result<(usize, BTreeSet<PathBuf>)> {
     let root_str = root.to_string_lossy().to_string();
+    let existing = db
+        .lock()
+        .ok()
+        .and_then(|g| g.get_local_tracks_index().ok())
+        .unwrap_or_default();
+
+    if let Some(tx) = status_tx {
+        let _ = tx.send(ScanStatus::Scanning {
+            root: root_str.clone(),
+            scanned_dirs: 0,
+            audio_files_found: 0,
+            indexed: existing.len(),
+        });
+    }
+
     let mut scanned_dirs = 0usize;
     let mut found = 0usize;
     let mut indexed = 0usize;
+    let mut audio_dirs = BTreeSet::new();
+    let mut pending_batch: Vec<Track> = Vec::new();
 
     let walker = WalkDir::new(root)
         .follow_links(false)
@@ -195,7 +223,7 @@ pub fn scan_directory_sync(
     for entry in walker.flatten() {
         if entry.file_type().is_dir() {
             scanned_dirs += 1;
-            if scanned_dirs % 25 == 0 {
+            if scanned_dirs % 50 == 0 {
                 if let Some(tx) = status_tx {
                     let _ = tx.send(ScanStatus::Scanning {
                         root: root_str.clone(),
@@ -214,14 +242,35 @@ pub fn scan_directory_sync(
         }
 
         found += 1;
+        if let Some(parent) = path.parent() {
+            audio_dirs.insert(parent.to_path_buf());
+        }
+
+        let key = format!("local:{}", path.to_string_lossy());
+        let file_len = std::fs::metadata(path).map(|m| m.len()).ok();
+        if let (Some((prev_len, _)), Some(cur_len)) = (existing.get(&key), file_len) {
+            if *prev_len == cur_len {
+                // Already indexed with identical size: skip re-opening with lofty on startup.
+                indexed += 1;
+                continue;
+            }
+        }
+
         if let Ok(track) = extract_track_metadata(path) {
-            if let Ok(guard) = db.lock() {
-                if guard.upsert_track(&track).is_ok() {
-                    indexed += 1;
+            pending_batch.push(track);
+            if pending_batch.len() >= 25 {
+                if let Ok(guard) = db.lock() {
+                    for tr in pending_batch.drain(..) {
+                        if guard.upsert_track(&tr).is_ok() {
+                            indexed += 1;
+                        }
+                    }
+                } else {
+                    pending_batch.clear();
                 }
             }
         }
-        if found % 10 == 0 {
+        if found % 20 == 0 {
             if let Some(tx) = status_tx {
                 let _ = tx.send(ScanStatus::Scanning {
                     root: root_str.clone(),
@@ -229,6 +278,16 @@ pub fn scan_directory_sync(
                     audio_files_found: found,
                     indexed,
                 });
+            }
+        }
+    }
+
+    if !pending_batch.is_empty() {
+        if let Ok(guard) = db.lock() {
+            for tr in pending_batch.drain(..) {
+                if guard.upsert_track(&tr).is_ok() {
+                    indexed += 1;
+                }
             }
         }
     }
@@ -241,19 +300,32 @@ pub fn scan_directory_sync(
         });
     }
 
-    Ok(indexed)
+    Ok((indexed, audio_dirs))
 }
 
 pub fn spawn_home_scan(
     root: PathBuf,
     db: Arc<Mutex<Database>>,
     status_tx: watch::Sender<ScanStatus>,
+    watcher_slot: Option<Arc<Mutex<Option<RecommendedWatcher>>>>,
 ) -> tokio::task::JoinHandle<Result<usize>> {
-    tokio::task::spawn_blocking(move || scan_directory_sync(&root, &db, Some(&status_tx)))
+    tokio::task::spawn_blocking(move || {
+        let (indexed, audio_dirs) =
+            scan_directory_incremental(&root, &db, Some(&status_tx))?;
+        if let Some(slot) = watcher_slot {
+            if let Ok(w) = start_watcher_for_dirs(&audio_dirs, &root, Arc::clone(&db)) {
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some(w);
+                }
+            }
+        }
+        Ok(indexed)
+    })
 }
 
-pub fn start_incremental_watcher(
-    root: &Path,
+pub fn start_watcher_for_dirs(
+    dirs: &BTreeSet<PathBuf>,
+    fallback_root: &Path,
     db: Arc<Mutex<Database>>,
 ) -> Result<RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
@@ -269,10 +341,28 @@ pub fn start_incremental_watcher(
             }
         }
     })?;
-    if root.exists() {
-        watcher.watch(root, RecursiveMode::Recursive)?;
+
+    if dirs.is_empty() {
+        if fallback_root.exists() {
+            let _ = watcher.watch(fallback_root, RecursiveMode::NonRecursive);
+        }
+    } else {
+        for dir in dirs {
+            if dir.exists() {
+                let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
+            }
+        }
     }
     Ok(watcher)
+}
+
+pub fn start_incremental_watcher(
+    root: &Path,
+    db: Arc<Mutex<Database>>,
+) -> Result<RecommendedWatcher> {
+    let mut dirs = BTreeSet::new();
+    dirs.insert(root.to_path_buf());
+    start_watcher_for_dirs(&dirs, root, db)
 }
 
 /// Seekable reader supporting both byte-range seeking and proportional time-based seeking.

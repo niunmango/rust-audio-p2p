@@ -46,6 +46,7 @@ struct SharedPlayerState {
     duration_secs: Option<f64>,
     volume: f32,
     last_error: Option<String>,
+    track_finished: bool,
 }
 
 enum PlayerCmd {
@@ -93,6 +94,7 @@ impl PlayerEngine {
             duration_secs: None,
             volume: 1.0,
             last_error: None,
+            track_finished: false,
         }));
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<PlayerCmd>();
@@ -171,6 +173,7 @@ impl PlayerEngine {
                                 g.play_started_at = Some(Instant::now());
                                 g.state = PlaybackState::Playing;
                                 g.last_error = err_msg;
+                                g.track_finished = false;
                             }
                         }
                         PlayerCmd::TogglePause => {
@@ -199,6 +202,7 @@ impl PlayerEngine {
                                 g.state = PlaybackState::Stopped;
                                 g.base_pos_secs = 0.0;
                                 g.play_started_at = None;
+                                g.track_finished = false;
                             }
                         }
                         PlayerCmd::SeekTo(target_secs) => {
@@ -245,6 +249,7 @@ impl PlayerEngine {
                                         if sink.empty() {
                                             g.state = PlaybackState::Stopped;
                                             g.play_started_at = None;
+                                            g.track_finished = true;
                                         }
                                     }
                                 }
@@ -257,6 +262,7 @@ impl PlayerEngine {
                                         g.base_pos_secs = dur;
                                         g.state = PlaybackState::Stopped;
                                         g.play_started_at = None;
+                                        g.track_finished = true;
                                     }
                                 }
                             }
@@ -325,6 +331,16 @@ impl PlayerEngine {
         self.cmd_tx
             .send(PlayerCmd::SetPrefetch(next))
             .map_err(|e| anyhow::anyhow!("player worker unavailable: {e}"))
+    }
+
+    pub fn take_track_finished(&self) -> bool {
+        if let Ok(mut g) = self.shared.lock() {
+            let finished = g.track_finished;
+            g.track_finished = false;
+            finished
+        } else {
+            false
+        }
     }
 
     pub fn status(&self) -> PlayerStatus {
@@ -551,5 +567,31 @@ mod tests {
         assert!((st2.volume - 0.75).abs() < 0.01);
 
         let _ = std::fs::remove_file(&temp_next);
+    }
+
+    #[test]
+    fn test_headless_player_auto_next_signal_on_finish() {
+        let t_short = Track {
+            id: 99,
+            title: "Short".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            year: Some(2025),
+            track_number: Some(1),
+            duration_secs: Some(1),
+            file_size_bytes: 128,
+            format: "flac".to_string(),
+            cover_path: None,
+            source: TrackSource::LocalFile {
+                path: "/tmp/nonexistent_short.flac".to_string(),
+            },
+            pinned: false,
+        };
+        let player = PlayerEngine::new_headless();
+        player.play_track(t_short, None).unwrap();
+        player.seek_to(0.95).unwrap();
+        std::thread::sleep(Duration::from_millis(260));
+        assert!(player.take_track_finished(), "track_finished flag should trigger when playback reaches duration");
+        assert!(!player.take_track_finished(), "take_track_finished should consume the flag");
     }
 }

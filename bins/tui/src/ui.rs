@@ -1,12 +1,12 @@
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, Tabs};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
-use rust_audio_core::ScanStatus;
+use rust_audio_core::{I18n, ScanStatus};
 use rust_audio_player::{AudioBackendKind, PlaybackState};
 
-use crate::app::{App, Tab, TorrentInputMode};
+use crate::app::{App, PlaylistPanelFocus, Tab, TorrentInputMode};
 
 fn fmt_time(secs: f64) -> String {
     let total = secs.max(0.0) as u64;
@@ -17,31 +17,104 @@ fn fmt_mb(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
+fn ascii_progress_bar(pct: f64, width: usize) -> String {
+    let clamped = pct.clamp(0.0, 100.0);
+    let filled = ((clamped / 100.0) * width as f64).round() as usize;
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}] {:5.1}%", "█".repeat(filled), "░".repeat(empty), clamped)
+}
+
+pub fn draw_loading_screen(frame: &mut Frame, i18n: &I18n) {
+    let area = frame.area();
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(35),
+            Constraint::Length(7),
+            Constraint::Percentage(35),
+        ])
+        .split(area);
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Percentage(70),
+            Constraint::Percentage(15),
+        ])
+        .split(v[1]);
+
+    let text = vec![
+        Line::from(""),
+        Line::styled(
+            format!("♪  {}", i18n.loading_title()),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+        Line::styled(
+            i18n.loading_subtitle(),
+            Style::default().fg(Color::Gray),
+        ),
+    ];
+    let p = Paragraph::new(text)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" rust-audio-p2p "),
+        );
+    frame.render_widget(p, h[1]);
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
+    let is_scanning = matches!(&*app.scan_rx.borrow(), ScanStatus::Scanning { .. });
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Top header + scan + backend + lang
-            Constraint::Length(3), // Tabs
-            Constraint::Min(8),    // Main content
-            Constraint::Length(5), // Player bar
-            Constraint::Length(2), // Help footer
+            Constraint::Length(3),                         // Top header
+            Constraint::Length(3),                         // Tabs
+            Constraint::Length(if is_scanning { 3 } else { 0 }), // Prominent scan banner
+            Constraint::Min(8),                            // Main content
+            Constraint::Length(5),                         // Player bar
+            Constraint::Length(2),                         // Help footer
         ])
         .split(frame.area());
 
     draw_header(frame, app, root[0]);
     draw_tabs(frame, app, root[1]);
-
-    match app.active_tab {
-        Tab::Library => draw_track_table(frame, app, &app.tracks, app.library_selected, app.i18n.tab_library(), root[2]),
-        Tab::Search => draw_search(frame, app, root[2]),
-        Tab::Playlists => draw_playlists(frame, app, root[2]),
-        Tab::Torrents => draw_torrents(frame, app, root[2]),
-        Tab::CacheSettings => draw_cache_settings(frame, app, root[2]),
+    if is_scanning {
+        draw_scan_banner(frame, app, root[2]);
     }
 
-    draw_player_bar(frame, app, root[3]);
-    draw_footer(frame, app, root[4]);
+    match app.active_tab {
+        Tab::Library => {
+            let mut l = app.layout.borrow_mut();
+            l.library_table = root[3];
+            drop(l);
+            let scroll = draw_track_table(
+                frame,
+                app,
+                &app.tracks,
+                app.library_selected,
+                &format!("{} ([a]: +Playlist | [p]: Pin)", app.i18n.tab_library()),
+                root[3],
+                true,
+            );
+            app.layout.borrow_mut().library_scroll = scroll;
+        }
+        Tab::Search => draw_search(frame, app, root[3]),
+        Tab::Playlists => draw_playlists(frame, app, root[3]),
+        Tab::Torrents => draw_torrents(frame, app, root[3]),
+        Tab::CacheSettings => draw_cache_settings(frame, app, root[3]),
+    }
+
+    draw_player_bar(frame, app, root[4]);
+    draw_footer(frame, app, root[5]);
+
+    if app.playlist_picker.is_some() {
+        draw_playlist_picker_modal(frame, app);
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -79,18 +152,55 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
 }
 
+fn draw_scan_banner(frame: &mut Frame, app: &App, area: Rect) {
+    if let ScanStatus::Scanning {
+        scanned_dirs,
+        audio_files_found,
+        indexed,
+        ..
+    } = &*app.scan_rx.borrow()
+    {
+        let msg = app
+            .i18n
+            .scan_banner_running(*scanned_dirs, *audio_files_found, *indexed);
+        let p = Paragraph::new(Line::styled(
+            msg,
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+        frame.render_widget(p, area);
+    }
+}
+
 fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
-    let titles: Vec<Line> = vec![
-        Line::from(app.i18n.tab_library()),
-        Line::from(app.i18n.tab_search()),
-        Line::from(app.i18n.tab_playlists()),
-        Line::from(app.i18n.tab_torrents()),
-        Line::from(app.i18n.tab_cache_settings()),
+    let raw_titles = [
+        app.i18n.tab_library(),
+        app.i18n.tab_search(),
+        app.i18n.tab_playlists(),
+        app.i18n.tab_torrents(),
+        app.i18n.tab_cache_settings(),
     ];
+    let titles: Vec<Line> = raw_titles.iter().map(|t| Line::from(*t)).collect();
     let idx = Tab::all()
         .iter()
         .position(|t| *t == app.active_tab)
         .unwrap_or(0);
+
+    // Record exact clickable bounding rectangles for each tab title
+    {
+        let mut layout = app.layout.borrow_mut();
+        let mut cursor_x = area.x + 1;
+        for (i, title) in raw_titles.iter().enumerate() {
+            let w = title.chars().count() as u16 + 2;
+            layout.tab_rects[i] = Rect::new(cursor_x, area.y, w, area.height);
+            cursor_x = cursor_x.saturating_add(w + 2); // divider " │ "
+        }
+    }
+
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::ALL))
         .select(idx)
@@ -109,7 +219,8 @@ fn draw_track_table(
     selected: usize,
     title: &str,
     area: Rect,
-) {
+    focused: bool,
+) -> usize {
     let header = Row::new(vec![
         Cell::from(app.i18n.col_pin()),
         Cell::from(app.i18n.col_title()),
@@ -133,11 +244,13 @@ fn draw_track_table(
         .take(height.max(1))
         .map(|(i, t)| {
             let pin_mark = if t.pinned { "★" } else { " " };
-            let style = if i == selected {
+            let style = if i == selected && focused {
                 Style::default()
                     .bg(Color::DarkGray)
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
+            } else if i == selected {
+                Style::default().fg(Color::Cyan)
             } else {
                 Style::default()
             };
@@ -151,6 +264,12 @@ fn draw_track_table(
             .style(style)
         });
 
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+
     let table = Table::new(
         rows,
         [
@@ -162,8 +281,14 @@ fn draw_track_table(
         ],
     )
     .header(header)
-    .block(Block::default().borders(Borders::ALL).title(format!(" {title} ({}) ", tracks.len())));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(format!(" {title} ({}) ", tracks.len())),
+    );
     frame.render_widget(table, area);
+    start
 }
 
 fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
@@ -172,53 +297,103 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Length(3), Constraint::Min(5)])
         .split(area);
 
-    let prompt_style = if app.search_editing {
+    let cursor = if app.search_editing { "█" } else { "" };
+    let border_style = if app.search_editing {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
+        Style::default().fg(Color::Gray)
     };
-    let input = Paragraph::new(format!("{}{}", app.i18n.search_prompt(), app.search_query))
-        .style(prompt_style)
-        .block(Block::default().borders(Borders::ALL).title(app.i18n.search_hint()));
+    let input = Paragraph::new(format!("{}{}{}", app.i18n.search_prompt(), app.search_query, cursor))
+        .style(if app.search_editing {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(format!(" {} ", app.i18n.search_hint())),
+        );
     frame.render_widget(input, chunks[0]);
 
-    draw_track_table(
+    let scroll = draw_track_table(
         frame,
         app,
         &app.search_results,
         app.search_selected,
         app.i18n.tab_search(),
         chunks[1],
+        true,
     );
+
+    let mut l = app.layout.borrow_mut();
+    l.search_input = chunks[0];
+    l.search_table = chunks[1];
+    l.search_scroll = scroll;
 }
 
 fn draw_playlists(frame: &mut Frame, app: &App, area: Rect) {
+    let main_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(6)])
+        .split(area);
+
+    let guide = Paragraph::new(app.i18n.playlists_guide())
+        .style(Style::default().fg(Color::Yellow))
+        .wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(guide, main_rows[0]);
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(area);
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(main_rows[1]);
 
     let left_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(4)])
         .split(cols[0]);
 
+    let cursor = if app.playlist_editing { "█" } else { "" };
+    let input_border = if app.playlist_editing {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     let new_pl = Paragraph::new(format!(
-        "{}: {}",
-        if app.playlist_editing { "Nueva / New [*]" } else { "[n] Nueva / New" },
-        app.playlist_input
+        "{}: {}{}",
+        if app.playlist_editing { "Nombre / Name" } else { "[n / Clic] Nueva / New" },
+        app.playlist_input,
+        cursor
     ))
-    .block(Block::default().borders(Borders::ALL).title(app.i18n.playlists_header()));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(input_border)
+            .title(format!(" {} ", app.i18n.playlists_header())),
+    );
     frame.render_widget(new_pl, left_rows[0]);
 
+    let pl_focused = app.playlist_focus == PlaylistPanelFocus::Playlists;
+    let list_height = left_rows[1].height.saturating_sub(2) as usize;
+    let pl_scroll = if list_height > 0 && app.playlist_selected >= list_height {
+        app.playlist_selected - list_height + 1
+    } else {
+        0
+    };
     let pl_lines: Vec<Line> = app
         .playlists
         .iter()
         .enumerate()
+        .skip(pl_scroll)
+        .take(list_height.max(1))
         .map(|(i, p)| {
             let pin = if p.pinned { "★ " } else { "  " };
-            let st = if i == app.playlist_selected {
-                Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            let st = if i == app.playlist_selected && pl_focused {
+                Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
+            } else if i == app.playlist_selected {
+                Style::default().fg(Color::Cyan)
             } else {
                 Style::default()
             };
@@ -228,9 +403,46 @@ fn draw_playlists(frame: &mut Frame, app: &App, area: Rect) {
     let pl_widget = Paragraph::new(pl_lines).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_style(if pl_focused { Style::default().fg(Color::Cyan) } else { Style::default() })
             .title(format!(" {} ({}) ", app.i18n.playlists_header(), app.playlists.len())),
     );
     frame.render_widget(pl_widget, left_rows[1]);
+
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(cols[1]);
+
+    let tracks_focused = app.playlist_focus == PlaylistPanelFocus::PlaylistTracks;
+    let pl_name = app
+        .playlists
+        .get(app.playlist_selected)
+        .map(|p| p.name.as_str())
+        .unwrap_or("—");
+
+    let pt_scroll = if app.selected_playlist_tracks.is_empty() {
+        let empty = Paragraph::new(app.i18n.playlist_empty_hint())
+            .style(Style::default().fg(Color::Gray))
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if tracks_focused { Style::default().fg(Color::Cyan) } else { Style::default() })
+                    .title(format!(" {} ", app.i18n.playlist_tracks_header(pl_name))),
+            );
+        frame.render_widget(empty, right_rows[0]);
+        0
+    } else {
+        draw_track_table(
+            frame,
+            app,
+            &app.selected_playlist_tracks,
+            app.playlist_track_selected,
+            &app.i18n.playlist_tracks_header(pl_name),
+            right_rows[0],
+            tracks_focused,
+        )
+    };
 
     draw_track_table(
         frame,
@@ -238,62 +450,95 @@ fn draw_playlists(frame: &mut Frame, app: &App, area: Rect) {
         &app.pinned_tracks,
         0,
         app.i18n.pinned_offline_header(),
-        cols[1],
+        right_rows[1],
+        false,
     );
+
+    let mut l = app.layout.borrow_mut();
+    l.playlist_input = left_rows[0];
+    l.playlists_list = left_rows[1];
+    l.playlists_scroll = pl_scroll;
+    l.playlist_tracks_table = right_rows[0];
+    l.playlist_tracks_scroll = pt_scroll;
 }
 
 fn draw_torrents(frame: &mut Frame, app: &App, area: Rect) {
+    let search_bar_h = if app.torrent_searching { 3 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(3), // Search input
+            Constraint::Length(3), // Magnet input
+            Constraint::Length(search_bar_h), // Search progress bar
             Constraint::Percentage(50),
-            Constraint::Percentage(45),
+            Constraint::Min(5),
         ])
         .split(area);
 
-    let search_line = Line::from(vec![
-        Span::styled("[s] ", Style::default().fg(Color::Yellow)),
-        Span::raw(app.i18n.torrents_search_prompt()),
-        Span::styled(
-            &app.torrent_query,
-            if app.torrent_input_mode == TorrentInputMode::Search {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            },
-        ),
-    ]);
-    let magnet_line = Line::from(vec![
-        Span::styled("[m] ", Style::default().fg(Color::Yellow)),
-        Span::raw(app.i18n.torrents_magnet_prompt()),
-        Span::styled(
-            &app.torrent_magnet_input,
-            if app.torrent_input_mode == TorrentInputMode::Magnet {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            },
-        ),
-    ]);
-    let input_box = Paragraph::new(vec![search_line, magnet_line])
-        .block(Block::default().borders(Borders::ALL).title(app.search_provider.provider_names().join(" + ")));
-    frame.render_widget(input_box, chunks[0]);
+    let s_cursor = if app.torrent_input_mode == TorrentInputMode::Search { "█" } else { "" };
+    let m_cursor = if app.torrent_input_mode == TorrentInputMode::Magnet { "█" } else { "" };
 
-    let res_rows = app.torrent_results.iter().enumerate().map(|(i, r)| {
-        let st = if i == app.torrent_result_selected {
-            Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        Row::new(vec![
-            Cell::from(r.title.clone()),
-            Cell::from(format!("{}", r.seeders)),
-            Cell::from(fmt_mb(r.size_bytes)),
-            Cell::from(r.provider.clone()),
-        ])
-        .style(st)
-    });
+    let search_box = Paragraph::new(format!("[s] {}{}{}", app.i18n.torrents_search_prompt(), app.torrent_query, s_cursor))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if app.torrent_input_mode == TorrentInputMode::Search {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                })
+                .title(format!(" {} (Enter = Search) ", app.search_provider.provider_names().join(" + "))),
+        );
+    frame.render_widget(search_box, chunks[0]);
+
+    let magnet_box = Paragraph::new(format!("[m] {}{}{}", app.i18n.torrents_magnet_prompt(), app.torrent_magnet_input, m_cursor))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if app.torrent_input_mode == TorrentInputMode::Magnet {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                }),
+        );
+    frame.render_widget(magnet_box, chunks[1]);
+
+    if app.torrent_searching {
+        let pct = (app.torrent_search_ticks % 100).max(5);
+        let gauge = Gauge::default()
+            .block(Block::default().borders(Borders::ALL))
+            .gauge_style(Style::default().fg(Color::Yellow))
+            .percent(pct)
+            .label(app.i18n.torrents_searching_progress(&app.torrent_query));
+        frame.render_widget(gauge, chunks[2]);
+    }
+
+    let res_height = chunks[3].height.saturating_sub(4) as usize;
+    let res_scroll = if res_height > 0 && app.torrent_result_selected >= res_height {
+        app.torrent_result_selected - res_height + 1
+    } else {
+        0
+    };
+    let res_rows = app
+        .torrent_results
+        .iter()
+        .enumerate()
+        .skip(res_scroll)
+        .take(res_height.max(1))
+        .map(|(i, r)| {
+            let st = if i == app.torrent_result_selected {
+                Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
+                Cell::from(r.title.clone()),
+                Cell::from(format!("{}", r.seeders)),
+                Cell::from(fmt_mb(r.size_bytes)),
+                Cell::from(r.provider.clone()),
+            ])
+            .style(st)
+        });
     let res_table = Table::new(
         res_rows,
         [
@@ -304,8 +549,8 @@ fn draw_torrents(frame: &mut Frame, app: &App, area: Rect) {
         ],
     )
     .header(Row::new(vec!["Torrent", "Seeds", "Size", "Provider"]).style(Style::default().fg(Color::Yellow)))
-    .block(Block::default().borders(Borders::ALL).title(" Results (Enter = Add) "));
-    frame.render_widget(res_table, chunks[1]);
+    .block(Block::default().borders(Borders::ALL).title(format!(" Results ({}) [Enter / Double-Click = Add] ", app.torrent_results.len())));
+    frame.render_widget(res_table, chunks[3]);
 
     let active_lines: Vec<Line> = app
         .active_torrents
@@ -316,15 +561,29 @@ fn draw_torrents(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 0.0
             };
+            let bar = ascii_progress_bar(pct, 18);
             Line::from(format!(
-                "#{} {} | {} | {:.1}% | {:.2} MB/s | peers: {}",
-                t.id, t.name, t.state, pct, t.download_speed_mbps, t.peers_live
+                "#{} {} {} | {} / {} | {:.2} MB/s | peers: {} ({})",
+                t.id,
+                bar,
+                t.name,
+                fmt_mb(t.progress_bytes),
+                fmt_mb(t.total_bytes),
+                t.download_speed_mbps,
+                t.peers_live,
+                t.state
             ))
         })
         .collect();
     let active_box = Paragraph::new(active_lines)
         .block(Block::default().borders(Borders::ALL).title(app.i18n.torrents_active_header()));
-    frame.render_widget(active_box, chunks[2]);
+    frame.render_widget(active_box, chunks[4]);
+
+    let mut l = app.layout.borrow_mut();
+    l.torrent_search_input = chunks[0];
+    l.torrent_magnet_input = chunks[1];
+    l.torrent_results_table = chunks[3];
+    l.torrent_results_scroll = res_scroll;
 }
 
 fn draw_cache_settings(frame: &mut Frame, app: &App, area: Rect) {
@@ -344,7 +603,10 @@ fn draw_cache_settings(frame: &mut Frame, app: &App, area: Rect) {
             fmt_mb(stats.evictable_bytes)
         )),
         Line::from(app.i18n.language_label()),
-        Line::from("Keys: [c] Purge unpinned LRU cache | [ / ] Adjust limit (-/+ 512 MB) | [l] Switch language"),
+        Line::from(format!(
+            "{} | [c] Purge unpinned | [ / ] Limit (-/+ 512 MB) | [l] Language",
+            app.i18n.auto_next_label(app.auto_next)
+        )),
         Line::from(format!("Status: {}", app.status_message)),
     ];
     let p = Paragraph::new(lines)
@@ -381,8 +643,19 @@ fn draw_player_bar(frame: &mut Frame, app: &App, area: Rect) {
         .margin(1)
         .split(area);
 
+    let auto_lbl = app.i18n.auto_next_label(app.auto_next);
+    let add_pl_lbl = "[+ Playlist (a)]";
+    let title_str = format!(
+        " {state_label} | Vol: {:.0}% ",
+        st.volume * 100.0
+    );
+    let right_pills = format!(" {add_pl_lbl} | {auto_lbl} ");
+
     frame.render_widget(
-        Block::default().borders(Borders::ALL).title(format!(" {state_label} | Vol: {:.0}% ", st.volume * 100.0)),
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title_str)
+            .title_top(Line::from(right_pills).right_aligned()),
         area,
     );
     frame.render_widget(Paragraph::new(track_label), chunks[0]);
@@ -398,10 +671,95 @@ fn draw_player_bar(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(Color::Gray)),
         chunks[2],
     );
+
+    let mut l = app.layout.borrow_mut();
+    l.player_bar = area;
+    l.player_gauge = chunks[1];
+    let auto_w = auto_lbl.chars().count() as u16 + 1;
+    let auto_x = area.x + area.width.saturating_sub(auto_w + 2);
+    l.auto_next_pill = Rect::new(auto_x, area.y, auto_w, 1);
+    let add_w = add_pl_lbl.chars().count() as u16 + 1;
+    let add_x = auto_x.saturating_sub(add_w + 2);
+    l.add_playlist_btn = Rect::new(add_x, area.y, add_w, 1);
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let footer = Paragraph::new(app.i18n.help_footer())
         .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
+}
+
+fn draw_playlist_picker_modal(frame: &mut Frame, app: &App) {
+    let Some(picker) = &app.playlist_picker else {
+        return;
+    };
+    let area = frame.area();
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(20),
+            Constraint::Percentage(60),
+            Constraint::Percentage(20),
+        ])
+        .split(area);
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(20),
+            Constraint::Percentage(60),
+            Constraint::Percentage(20),
+        ])
+        .split(v[1]);
+    let modal_area = h[1];
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .title(format!(" {} ", app.i18n.playlist_picker_title()));
+    frame.render_widget(block, modal_area);
+
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(4)])
+        .margin(1)
+        .split(modal_area);
+
+    frame.render_widget(
+        Paragraph::new(format!("♪ {} — {}", picker.track.artist, picker.track.title))
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        inner[0],
+    );
+
+    let mut lines: Vec<Line> = app
+        .playlists
+        .iter()
+        .enumerate()
+        .map(|(i, pl)| {
+            let st = if !picker.creating_new && i == picker.selected {
+                Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::styled(format!("  {} ({})", pl.name, pl.track_count), st)
+        })
+        .collect();
+
+    let new_opt = if picker.creating_new {
+        format!("  {} {}█", app.i18n.playlist_picker_new_option(), picker.new_name)
+    } else {
+        format!("  {}", app.i18n.playlist_picker_new_option())
+    };
+    let new_style = if picker.creating_new || picker.selected == app.playlists.len() {
+        Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    lines.push(Line::styled(new_opt, new_style));
+
+    frame.render_widget(Paragraph::new(lines), inner[1]);
+
+    let mut l = app.layout.borrow_mut();
+    l.modal_box = modal_area;
+    l.modal_list = inner[1];
 }

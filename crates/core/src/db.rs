@@ -328,6 +328,32 @@ impl Database {
         Ok(())
     }
 
+    pub fn remove_track_from_playlist(&self, playlist_id: i64, track_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id = ?1 AND track_id = ?2",
+            params![playlist_id, track_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_local_tracks_index(&self) -> Result<std::collections::HashMap<String, (u64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_key, file_size_bytes, updated_at FROM tracks WHERE source_type = 'local'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?.max(0) as u64, row.get::<_, i64>(2)?),
+            ))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for r in rows {
+            let (k, v) = r?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
     pub fn get_playlist_tracks(&self, playlist_id: i64) -> Result<Vec<Track>> {
         let mut stmt = self.conn.prepare(
             r#"

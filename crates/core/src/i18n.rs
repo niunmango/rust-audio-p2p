@@ -171,8 +171,42 @@ impl I18n {
 
     pub fn scan_running(&self, dirs: usize, found: usize) -> String {
         match self.lang {
-            Language::Es => format!("Escaneando $HOME ({dirs} dirs, {found} pistas)..."),
-            Language::En => format!("Scanning $HOME ({dirs} dirs, {found} tracks)..."),
+            Language::Es => format!("⟳ Escaneando $HOME ({dirs} dirs, {found} pistas)..."),
+            Language::En => format!("⟳ Scanning $HOME ({dirs} dirs, {found} tracks)..."),
+        }
+    }
+
+    pub fn scan_banner_running(&self, dirs: usize, found: usize, indexed: usize) -> String {
+        match self.lang {
+            Language::Es => format!(
+                "⟳ Escaneo inicial en progreso en segundo plano: {dirs} carpetas revisadas | {found} archivos de audio | {indexed} indexados..."
+            ),
+            Language::En => format!(
+                "⟳ Initial scan in progress in background: {dirs} folders checked | {found} audio files | {indexed} indexed..."
+            ),
+        }
+    }
+
+    pub fn loading_title(&self) -> &'static str {
+        self.t(
+            "Iniciando rust-audio-p2p...",
+            "Starting rust-audio-p2p...",
+        )
+    }
+
+    pub fn loading_subtitle(&self) -> &'static str {
+        self.t(
+            "Cargando biblioteca SQLite y preparando escaneo incremental de $HOME en segundo plano...",
+            "Loading SQLite library and starting background incremental $HOME scan...",
+        )
+    }
+
+    pub fn auto_next_label(&self, enabled: bool) -> &'static str {
+        match (self.lang, enabled) {
+            (Language::Es, true) => "Auto-Sig: ON [A]",
+            (Language::Es, false) => "Auto-Sig: OFF [A]",
+            (Language::En, true) => "Auto-Next: ON [A]",
+            (Language::En, false) => "Auto-Next: OFF [A]",
         }
     }
 
@@ -184,15 +218,15 @@ impl I18n {
     }
 
     pub fn status_playing(&self) -> &'static str {
-        self.t("REPRODUCIENDO", "PLAYING")
+        self.t("▶ REPRODUCIENDO", "▶ PLAYING")
     }
 
     pub fn status_paused(&self) -> &'static str {
-        self.t("PAUSA", "PAUSED")
+        self.t("⏸ PAUSA", "⏸ PAUSED")
     }
 
     pub fn status_stopped(&self) -> &'static str {
-        self.t("DETENIDO", "STOPPED")
+        self.t("■ DETENIDO", "■ STOPPED")
     }
 
     pub fn audio_backend_native(&self) -> &'static str {
@@ -222,13 +256,49 @@ impl I18n {
 
     pub fn search_hint(&self) -> &'static str {
         self.t(
-            "Escribí para buscar por título, artista o álbum. Enter: reproducir | Esc: salir de edición",
-            "Type to search by title, artist or album. Enter: play | Esc: exit input",
+            "Escribí directo aquí | ↑/↓: Mover | Enter: Reproducir | Esc: Salir de escritura (para usar a/p/1-5)",
+            "Type directly here | ↑/↓: Move | Enter: Play | Esc: Exit typing (to use a/p/1-5)",
         )
     }
 
     pub fn playlists_header(&self) -> &'static str {
         self.t("Playlists", "Playlists")
+    }
+
+    pub fn playlists_guide(&self) -> &'static str {
+        self.t(
+            "Guía: [n] o clic en caja = Crear playlist | En Biblioteca(1)/Buscar(2) apretá [a] sobre un tema para agregarlo | [Tab] Cambiar panel | [Enter] Reproducir | [d] Quitar tema | [p] Pin Viaje",
+            "Guide: [n] or click box = New playlist | In Library(1)/Search(2) press [a] on a track to add it | [Tab] Switch panel | [Enter] Play | [d] Remove track | [p] Travel Pin",
+        )
+    }
+
+    pub fn playlist_tracks_header(&self, name: &str) -> String {
+        match self.lang {
+            Language::Es => format!("Pistas en '{name}'"),
+            Language::En => format!("Tracks in '{name}'"),
+        }
+    }
+
+    pub fn playlist_empty_hint(&self) -> &'static str {
+        self.t(
+            "Esta playlist está vacía. Andá a '1: Biblioteca' o '2: Buscar', seleccioná un tema y apretá [a] para agregarlo acá.",
+            "This playlist is empty. Go to '1: Library' or '2: Search', select a track and press [a] to add it here.",
+        )
+    }
+
+    pub fn playlist_picker_title(&self) -> &'static str {
+        self.t("Agregar pista a Playlist (↑/↓/Clic + Enter | Esc: Cancelar)", "Add track to Playlist (↑/↓/Click + Enter | Esc: Cancel)")
+    }
+
+    pub fn playlist_picker_new_option(&self) -> &'static str {
+        self.t("[+ Crear nueva Playlist y agregar...]", "[+ Create new Playlist and add...]")
+    }
+
+    pub fn removed_from_playlist(&self, title: &str, playlist: &str) -> String {
+        match self.lang {
+            Language::Es => format!("Quitada '{title}' de '{playlist}'"),
+            Language::En => format!("Removed '{title}' from '{playlist}'"),
+        }
     }
 
     pub fn pinned_offline_header(&self) -> &'static str {
@@ -241,6 +311,13 @@ impl I18n {
 
     pub fn torrents_magnet_prompt(&self) -> &'static str {
         self.t("Magnet / .torrent URI: ", "Magnet / .torrent URI: ")
+    }
+
+    pub fn torrents_searching_progress(&self, query: &str) -> String {
+        match self.lang {
+            Language::Es => format!("⟳ Buscando '{query}' en Jackett / proveedores..."),
+            Language::En => format!("⟳ Searching '{query}' on Jackett / providers..."),
+        }
     }
 
     pub fn torrents_active_header(&self) -> &'static str {
@@ -265,8 +342,8 @@ impl I18n {
 
     pub fn help_footer(&self) -> &'static str {
         self.t(
-            "1-5: Pestañas | ↑/↓: Mover | Enter: Reproducir | Space: Pausa | ←/→: Seek ±10s | +/-: Vol | n/b: Sig/Ant | p: Pin | r: Re-escanear | /: Buscar | l: Idioma | q: Salir",
-            "1-5: Tabs | ↑/↓: Move | Enter: Play | Space: Pause | ←/→: Seek ±10s | +/-: Vol | n/b: Next/Prev | p: Pin | r: Rescan | /: Search | l: Lang | q: Quit",
+            "1-5/Clic: Pestañas | Enter/DobleClic: Reproducir | Space: Pausa | ←/→: Seek ±10s | +/-: Vol | n/b: Sig/Ant | A: Auto-Sig | a: +Playlist | p: Pin | r: Re-escanear | /: Buscar | l: Idioma | q: Salir",
+            "1-5/Click: Tabs | Enter/DblClick: Play | Space: Pause | ←/→: Seek ±10s | +/-: Vol | n/b: Next/Prev | A: Auto-Next | a: +Playlist | p: Pin | r: Rescan | /: Search | l: Lang | q: Quit",
         )
     }
 
