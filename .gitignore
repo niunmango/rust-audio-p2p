@@ -1,0 +1,12 @@
+/target
+/dist
+/plan.md
+lan-jackett.json
+*.db
+*.db-shm
+*.db-wal
+.cache/
+.env
+*.deb
+*.AppImage
+*.AppDir/
