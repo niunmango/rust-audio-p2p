@@ -35,8 +35,8 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
-      - name: Build release binary
-        run: cargo build --release -p rust-audio-tui
+      - name: Build release binaries
+        run: cargo build --release -p rust-audio-tui -p rust-audio-gui
 
       - name: Prepare optional APT GPG signing key
         env:
@@ -60,8 +60,10 @@ jobs:
           chmod +x scripts/package-linux.sh
           ./scripts/package-linux.sh
 
-      - name: Run binary self-test
-        run: ./target/release/rust-audio-tui --self-test
+      - name: Run binary self-tests
+        run: |
+          ./target/release/rust-audio-tui --self-test
+          ./target/release/rust-audio-gui --self-test
 
       - name: Build APT repository metadata for GitHub Pages
         env:

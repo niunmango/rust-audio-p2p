@@ -8,12 +8,13 @@ if [[ ! "$VERSION" =~ ^[0-9A-Za-z.+~-]+$ ]]; then
   echo "ERROR: invalid PKG_VERSION '$VERSION'" >&2
   exit 1
 fi
-BIN_PATH="$ROOT_DIR/target/release/rust-audio-tui"
+TUI_BIN_PATH="$ROOT_DIR/target/release/rust-audio-tui"
+GUI_BIN_PATH="$ROOT_DIR/target/release/rust-audio-gui"
 DIST_DIR="$ROOT_DIR/dist"
 
-if [[ ! -x "$BIN_PATH" ]]; then
-  echo "Building release binary..."
-  (cd "$ROOT_DIR" && cargo build --release -p rust-audio-tui)
+if [[ ! -x "$TUI_BIN_PATH" ]] || [[ ! -x "$GUI_BIN_PATH" ]]; then
+  echo "Building release binaries (TUI + GUI)..."
+  (cd "$ROOT_DIR" && cargo build --release -p rust-audio-tui -p rust-audio-gui)
 fi
 
 rm -rf "$DIST_DIR"
@@ -52,8 +53,10 @@ mkdir -p "$DEB_STAGE/DEBIAN" \
          "$DEB_STAGE/usr/share/doc/rust-audio-p2p" \
          "$DEB_STAGE/usr/share/rust-audio-p2p"
 
-install -m 0755 "$BIN_PATH" "$DEB_STAGE/usr/bin/rust-audio-tui"
+install -m 0755 "$TUI_BIN_PATH" "$DEB_STAGE/usr/bin/rust-audio-tui"
 ln -sf rust-audio-tui "$DEB_STAGE/usr/bin/localplayer"
+install -m 0755 "$GUI_BIN_PATH" "$DEB_STAGE/usr/bin/rust-audio-gui"
+ln -sf rust-audio-gui "$DEB_STAGE/usr/bin/localplayer-gui"
 install -m 0644 "$ROOT_DIR/LICENSE" "$DEB_STAGE/usr/share/doc/rust-audio-p2p/copyright"
 if [[ -f "$LAN_JACKETT_TMP" ]]; then
   install -m 0644 "$LAN_JACKETT_TMP" "$DEB_STAGE/usr/share/rust-audio-p2p/lan-jackett.json"
@@ -79,7 +82,7 @@ EOF
 cat << 'EOF' > "$DEB_STAGE/usr/share/applications/rust-audio-p2p.desktop"
 [Desktop Entry]
 Type=Application
-Name=rust-audio-p2p
+Name=rust-audio-p2p (TUI)
 GenericName=Audio Player
 Comment=Distributed Rust Audio Player & BitTorrent/P2P TUI
 Exec=/usr/bin/rust-audio-tui
@@ -88,6 +91,19 @@ Terminal=true
 Categories=AudioVideo;Audio;Player;
 EOF
 chmod 0644 "$DEB_STAGE/usr/share/applications/rust-audio-p2p.desktop"
+
+cat << 'EOF' > "$DEB_STAGE/usr/share/applications/rust-audio-p2p-gui.desktop"
+[Desktop Entry]
+Type=Application
+Name=rust-audio-p2p
+GenericName=Audio Player
+Comment=Distributed Rust Audio Player & BitTorrent/P2P Desktop GUI
+Exec=/usr/bin/rust-audio-gui
+Icon=audio-x-generic
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+EOF
+chmod 0644 "$DEB_STAGE/usr/share/applications/rust-audio-p2p-gui.desktop"
 
 INSTALLED_KB=$(du -sk "$DEB_STAGE/usr" | awk '{print $1}')
 cat << EOF > "$DEB_STAGE/DEBIAN/control"
@@ -100,10 +116,10 @@ Installed-Size: $INSTALLED_KB
 Depends: libc6, libasound2t64 | libasound2
 Maintainer: niunmango <niunmango@yahoo.com>
 Homepage: https://github.com/niunmango/rust-audio-p2p
-Description: Distributed Audio Player & P2P Network in Rust (TUI)
+Description: Distributed Audio Player & P2P Network in Rust (TUI + GUI + Web)
  Unified audio player supporting automatic \$HOME music discovery,
  SQLite FTS5 indexing, BitTorrent streaming (librqbit), LRU cache,
- offline travel pins, and bilingual ES/EN interface.
+ offline travel pins, LAN/Token P2P + Web UI/PWA, and bilingual ES/EN TUI + Desktop GUI.
 EOF
 
 DEB_OUT="$DIST_DIR/rust-audio-p2p_${VERSION}_amd64.deb"
@@ -116,8 +132,10 @@ echo "Built .deb: $DEB_OUT"
 APPDIR="$DIST_DIR/rust-audio-p2p.AppDir"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/scalable/apps" "$APPDIR/usr/share/rust-audio-p2p"
 
-install -m 0755 "$BIN_PATH" "$APPDIR/usr/bin/rust-audio-tui"
+install -m 0755 "$TUI_BIN_PATH" "$APPDIR/usr/bin/rust-audio-tui"
 ln -sf rust-audio-tui "$APPDIR/usr/bin/localplayer"
+install -m 0755 "$GUI_BIN_PATH" "$APPDIR/usr/bin/rust-audio-gui"
+ln -sf rust-audio-gui "$APPDIR/usr/bin/localplayer-gui"
 if [[ -f "$LAN_JACKETT_TMP" ]]; then
   install -m 0644 "$LAN_JACKETT_TMP" "$APPDIR/usr/share/rust-audio-p2p/lan-jackett.json"
 fi
@@ -126,9 +144,9 @@ cat << 'EOF' > "$APPDIR/rust-audio-p2p.desktop"
 [Desktop Entry]
 Type=Application
 Name=rust-audio-p2p
-Exec=rust-audio-tui
+Exec=rust-audio-gui
 Icon=rust-audio-p2p
-Terminal=true
+Terminal=false
 Categories=AudioVideo;Audio;Player;
 EOF
 cp "$APPDIR/rust-audio-p2p.desktop" "$APPDIR/usr/share/applications/rust-audio-p2p.desktop"
@@ -145,6 +163,12 @@ cp "$APPDIR/rust-audio-p2p.svg" "$APPDIR/usr/share/icons/hicolor/scalable/apps/r
 cat << 'EOF' > "$APPDIR/AppRun"
 #!/usr/bin/env bash
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${1:-}" == "--gui" ]]; then
+  shift
+  exec "$HERE/usr/bin/rust-audio-gui" "$@"
+elif [[ "${ARGV0:-}" == *gui* ]]; then
+  exec "$HERE/usr/bin/rust-audio-gui" "$@"
+fi
 exec "$HERE/usr/bin/rust-audio-tui" "$@"
 EOF
 chmod 0755 "$APPDIR/AppRun"
@@ -171,6 +195,7 @@ if [[ ! -f "\$MARKER" ]] || [[ "\$(cat "\$MARKER" 2>/dev/null || true)" != "\$SE
   echo "\$SELF_STAMP" > "\$MARKER"
 fi
 
+export ARGV0="\${ARGV0:-\$0}"
 exec "\$APPDIR_PATH/AppRun" "\$@"
 __APPIMAGE_ARCHIVE_BELOW__
 EOF
