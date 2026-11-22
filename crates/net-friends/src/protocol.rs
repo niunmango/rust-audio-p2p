@@ -145,6 +145,8 @@ pub struct RemoteTrackDto {
     pub duration_secs: Option<u64>,
     pub file_size_bytes: u64,
     pub format: String,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +162,90 @@ pub struct RemoteCatalogDto {
     pub node_name: String,
     pub tracks: Vec<RemoteTrackDto>,
     pub playlists: Vec<RemotePlaylistDto>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WebPlayerSnapshot {
+    pub state: String,
+    pub position_secs: f64,
+    pub duration_secs: Option<f64>,
+    pub volume: f32,
+    pub auto_next: bool,
+    pub current_track: Option<RemoteTrackDto>,
+    pub backend: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum WebRemoteCommand {
+    PlayTrack { track_id: i64 },
+    TogglePause,
+    Next,
+    Prev,
+    Seek { position_secs: f64 },
+    SetVolume { volume: f32 },
+    ToggleAutoNext,
+    TogglePin { track_id: i64 },
+    CreatePlaylist { name: String, track_id: Option<i64> },
+    AddToPlaylist { playlist_id: i64, track_id: i64 },
+    ConnectPeer { target: String },
+    DiscoverLan,
+    SyncRefresh { message: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebPlaylistSummary {
+    pub id: i64,
+    pub name: String,
+    pub pinned: bool,
+    pub track_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebPeerSummary {
+    pub node_id: String,
+    pub node_name: String,
+    pub endpoint: String,
+    pub track_count: usize,
+    pub playlist_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebStateDto {
+    pub node_id: String,
+    pub node_name: String,
+    pub endpoint: String,
+    pub ticket_uri: String,
+    pub lan_share: bool,
+    pub player: WebPlayerSnapshot,
+    pub peers: Vec<WebPeerSummary>,
+    pub playlists: Vec<WebPlaylistSummary>,
+}
+
+pub fn track_to_remote_dto(t: &rust_audio_core::Track) -> RemoteTrackDto {
+    RemoteTrackDto {
+        id: t.id,
+        title: t.title.clone(),
+        artist: t.artist.clone(),
+        album: t.album.clone(),
+        year: t.year,
+        track_number: t.track_number,
+        duration_secs: t.duration_secs,
+        file_size_bytes: t.file_size_bytes,
+        format: t.format.clone(),
+        pinned: t.pinned,
+    }
+}
+
+pub fn extract_query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(percent_decode(v));
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

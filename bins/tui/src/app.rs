@@ -11,9 +11,10 @@ use rust_audio_core::{
     PlaybackQueue, Playlist, ScanStatus, Track, TrackSource,
 };
 use rust_audio_net_friends::{
-    FriendNodeClient, FriendNodeServer, NodeIdentity, PeerTicket, RemoteCatalogDto,
+    track_to_remote_dto, FriendNodeClient, FriendNodeServer, NodeIdentity, PeerTicket,
+    RemoteCatalogDto, WebPlayerSnapshot, WebRemoteCommand,
 };
-use rust_audio_player::PlayerEngine;
+use rust_audio_player::{AudioBackendKind, PlaybackState, PlayerEngine};
 use rust_audio_source_local::{extract_track_metadata, is_supported_audio, spawn_home_scan, RecommendedWatcher};
 use rust_audio_source_torrent::{
     extract_magnet_display_name, redact_url_secrets, sanitize_torrent_uri, CompositeSearchProvider,
@@ -198,6 +199,7 @@ pub struct App {
     pub show_qr_modal: bool,
     pub p2p_logs: Vec<String>,
     pub pending_peer_downloads: HashMap<String, PeerDownloadIntent>,
+    pub web_cmd_rx: mpsc::UnboundedReceiver<WebRemoteCommand>,
     pub cache_stats: CacheStats,
     pub status_message: String,
     pub should_quit: bool,
@@ -255,6 +257,7 @@ impl App {
 
         let (scan_tx, scan_rx) = watch::channel(ScanStatus::Idle);
         let (async_tx, async_rx) = mpsc::unbounded_channel();
+        let (web_cmd_tx, web_cmd_rx) = mpsc::unbounded_channel();
         let watcher_slot = Arc::new(Mutex::new(None));
 
         if start_background_services {
@@ -279,14 +282,15 @@ impl App {
                 }
             });
 
-            // Start lightweight P2P node server + initial LAN discovery + existing peers refresh
+            // Start lightweight P2P node server + Web UI/PWA + initial LAN discovery + existing peers refresh
             let p2p_db = Arc::clone(&db);
             let p2p_id = node_identity.clone();
             let p2p_tx = async_tx.clone();
             let client_clone = p2p_client.clone();
             let existing_peers = paired_peers.clone();
+            let web_tx = web_cmd_tx.clone();
             tokio::spawn(async move {
-                match FriendNodeServer::start(p2p_db, p2p_id).await {
+                match FriendNodeServer::start_with_control(p2p_db, p2p_id, Some(web_tx)).await {
                     Ok(srv) => {
                         let srv_arc = Arc::new(srv);
                         let _ = p2p_tx.send(AsyncEvent::P2pServerReady(Arc::clone(&srv_arc)));
@@ -377,6 +381,7 @@ impl App {
             show_qr_modal: false,
             p2p_logs: Vec::new(),
             pending_peer_downloads: HashMap::new(),
+            web_cmd_rx,
             cache_stats,
             status_message: String::new(),
             should_quit: false,
@@ -687,9 +692,90 @@ impl App {
                 }
             }
         }
+        while let Ok(cmd) = self.web_cmd_rx.try_recv() {
+            match cmd {
+                WebRemoteCommand::PlayTrack { track_id } => {
+                    if let Some(pos) = self.tracks.iter().position(|t| t.id == track_id) {
+                        self.queue.set_queue(self.tracks.clone(), pos);
+                        let _ = self.play_current_in_queue();
+                    } else {
+                        let fetched = self
+                            .db
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.get_track(track_id).ok().flatten());
+                        if let Some(tr) = fetched {
+                            self.queue.play_now(tr);
+                            let _ = self.play_current_in_queue();
+                        }
+                    }
+                }
+                WebRemoteCommand::TogglePause => {
+                    let _ = self.player.toggle_pause();
+                }
+                WebRemoteCommand::Next => {
+                    let _ = self.next_track();
+                }
+                WebRemoteCommand::Prev => {
+                    let _ = self.prev_track();
+                }
+                WebRemoteCommand::Seek { position_secs } => {
+                    let _ = self.player.seek_to(position_secs);
+                }
+                WebRemoteCommand::SetVolume { volume } => {
+                    let _ = self.player.set_volume(volume);
+                }
+                WebRemoteCommand::ToggleAutoNext => {
+                    self.toggle_auto_next();
+                }
+                WebRemoteCommand::TogglePin { .. } => {}
+                WebRemoteCommand::CreatePlaylist { .. } | WebRemoteCommand::AddToPlaylist { .. } => {
+                    need_refresh = true;
+                }
+                WebRemoteCommand::ConnectPeer { target } => {
+                    self.push_p2p_log(format!("[WEB] Conectando a nodo '{target}'..."));
+                    self.spawn_peer_sync(target);
+                }
+                WebRemoteCommand::DiscoverLan => {
+                    self.trigger_lan_discovery();
+                }
+                WebRemoteCommand::SyncRefresh { message } => {
+                    if let Some(m) = message {
+                        self.status_message = m;
+                    }
+                    need_refresh = true;
+                }
+            }
+        }
         if need_refresh {
             let _ = self.refresh_from_db();
         }
+        self.sync_web_player_snapshot();
+    }
+
+    pub fn sync_web_player_snapshot(&self) {
+        let Some(srv) = &self.p2p_server else {
+            return;
+        };
+        let pst = self.player.status();
+        let state_str = match pst.state {
+            PlaybackState::Playing => "playing",
+            PlaybackState::Paused => "paused",
+            PlaybackState::Stopped => "stopped",
+        };
+        let backend_str = match pst.backend {
+            AudioBackendKind::NativeAlsaPipeWire => "native",
+            AudioBackendKind::HeadlessNullSink => "headless",
+        };
+        srv.update_player_snapshot(WebPlayerSnapshot {
+            state: state_str.to_string(),
+            position_secs: pst.position_secs,
+            duration_secs: pst.duration_secs,
+            volume: pst.volume,
+            auto_next: self.auto_next,
+            current_track: pst.current_track.as_ref().map(track_to_remote_dto),
+            backend: backend_str.to_string(),
+        });
     }
 
     pub fn selected_track_in_active_tab(&self) -> Option<Track> {

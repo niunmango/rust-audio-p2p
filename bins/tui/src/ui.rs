@@ -857,7 +857,7 @@ fn draw_friends(frame: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Local node + action buttons
+            Constraint::Length(4), // Local node + Web UI URL + action buttons
             Constraint::Length(3), // Connect input
             Constraint::Min(6),    // Peers/Log + Remote tracks
         ])
@@ -878,13 +878,20 @@ fn draw_friends(frame: &mut Frame, app: &App, area: Rect) {
 
     let ticket = app.local_p2p_ticket();
     let ticket_uri = ticket.to_uri();
-    let local_box = Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!("{} | ", ticket.node_name),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(ticket_uri, Style::default().fg(Color::Cyan)),
-    ]))
+    let web_url = format!("http://{}", ticket.endpoint);
+    let local_box = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{} | ", ticket.node_name),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                app.i18n.friends_web_url_label(&web_url),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::styled(ticket_uri, Style::default().fg(Color::Cyan)),
+    ])
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -1073,7 +1080,7 @@ fn draw_qr_modal(frame: &mut Frame, app: &App) {
 
     let inner = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(14), Constraint::Length(4)])
+        .constraints([Constraint::Min(14), Constraint::Length(5)])
         .margin(1)
         .split(modal_area);
 
@@ -1085,10 +1092,15 @@ fn draw_qr_modal(frame: &mut Frame, app: &App) {
         .collect();
     frame.render_widget(Paragraph::new(qr_lines).alignment(Alignment::Center), inner[0]);
 
+    let web_url = format!("http://{}", ticket.endpoint);
     let info_lines = vec![
         Line::styled(
             format!("Token: {}", ticket.to_uri()),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            app.i18n.friends_web_url_label(&web_url),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
         Line::styled(
             format!("IP/Puerto LAN: {}", ticket.endpoint),

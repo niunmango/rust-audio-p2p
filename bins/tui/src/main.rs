@@ -991,7 +991,7 @@ async fn run_self_test(scan_override: Option<PathBuf>) -> Result<()> {
         let pid = g.create_playlist("Shared Mix")?;
         g.add_track_to_playlist(pid, tid)?;
     }
-    let srv = FriendNodeServer::start_with_options(peer_db, peer_id, Some(0), None).await?;
+    let srv = FriendNodeServer::start_with_options(peer_db, peer_id.clone(), Some(0), None).await?;
     let client = FriendNodeClient::new();
     let (paired_peer, catalog) = client.resolve_and_sync_peer(&srv.ticket().to_uri()).await?;
     app.apply_synced_peer(paired_peer.clone(), catalog.clone())?;
@@ -1005,9 +1005,15 @@ async fn run_self_test(scan_override: Option<PathBuf>) -> Result<()> {
         .await?;
     assert!(cached_peer_file.exists());
     assert!(!app.peer_tracks.is_empty());
+
+    // Verify Web UI / PWA & Remote State HTTP endpoints return 200 OK
+    let web_url = srv.web_url();
+    let web_state = client.verify_web_ui(&web_url, &peer_id.auth_token).await?;
+    assert_eq!(web_state.playlists.len(), 1);
     srv.shutdown();
     println!(
-        "[7/8] P2P sync & audio stream verified (peers={}, remote_tracks={}, cached={})",
+        "[7/8] P2P sync, audio stream & Web UI/PWA verified (url={}, peers={}, remote_tracks={}, cached={})",
+        web_url,
         app.paired_peers.len(),
         app.peer_tracks.len(),
         cached_peer_file.display()

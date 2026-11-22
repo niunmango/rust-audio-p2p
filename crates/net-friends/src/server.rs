@@ -10,15 +10,19 @@ use anyhow::{Context, Result};
 use rust_audio_core::{Database, TrackSource};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::protocol::{
-    detect_lan_ip, verify_token_ct, NodeIdentity, NodeInfoDto, PeerTicket, RemoteCatalogDto,
-    RemotePlaylistDto, RemoteTrackDto, DEFAULT_P2P_PORT, DISCOVER_REQ_MSG, DISCOVER_RESP_PREFIX,
-    LAN_DISCOVERY_PORT, P2P_PORT_END,
+    detect_lan_ip, extract_query_param, track_to_remote_dto, verify_token_ct, NodeIdentity,
+    NodeInfoDto, PeerTicket, RemoteCatalogDto, RemotePlaylistDto, RemoteTrackDto, WebPeerSummary,
+    WebPlayerSnapshot, WebPlaylistSummary, WebRemoteCommand, WebStateDto, DEFAULT_P2P_PORT,
+    DISCOVER_REQ_MSG, DISCOVER_RESP_PREFIX, LAN_DISCOVERY_PORT, P2P_PORT_END,
 };
+use crate::webui;
 
 const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
+const MAX_CONTROL_BODY_BYTES: usize = 64 * 1024;
+const MAX_COVER_BYTES: u64 = 8 * 1024 * 1024;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 pub struct FriendNodeServer {
@@ -26,6 +30,7 @@ pub struct FriendNodeServer {
     pub lan_ip: String,
     pub identity: NodeIdentity,
     pub lan_share_enabled: Arc<AtomicBool>,
+    pub player_snapshot: Arc<Mutex<WebPlayerSnapshot>>,
     shutdown_tx: watch::Sender<bool>,
 }
 
@@ -37,7 +42,15 @@ impl Drop for FriendNodeServer {
 
 impl FriendNodeServer {
     pub async fn start(db: Arc<Mutex<Database>>, identity: NodeIdentity) -> Result<Self> {
-        Self::start_with_options(db, identity, None, Some(LAN_DISCOVERY_PORT)).await
+        Self::start_with_control(db, identity, None).await
+    }
+
+    pub async fn start_with_control(
+        db: Arc<Mutex<Database>>,
+        identity: NodeIdentity,
+        cmd_tx: Option<mpsc::UnboundedSender<WebRemoteCommand>>,
+    ) -> Result<Self> {
+        Self::start_with_full_options(db, identity, None, Some(LAN_DISCOVERY_PORT), cmd_tx).await
     }
 
     pub async fn start_with_options(
@@ -45,6 +58,16 @@ impl FriendNodeServer {
         identity: NodeIdentity,
         port_override: Option<u16>,
         udp_discovery_port: Option<u16>,
+    ) -> Result<Self> {
+        Self::start_with_full_options(db, identity, port_override, udp_discovery_port, None).await
+    }
+
+    pub async fn start_with_full_options(
+        db: Arc<Mutex<Database>>,
+        identity: NodeIdentity,
+        port_override: Option<u16>,
+        udp_discovery_port: Option<u16>,
+        cmd_tx: Option<mpsc::UnboundedSender<WebRemoteCommand>>,
     ) -> Result<Self> {
         let listener = if let Some(port) = port_override {
             let bind_ip = if port == 0 {
@@ -73,12 +96,14 @@ impl FriendNodeServer {
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
         let lan_share_enabled = Arc::new(AtomicBool::new(initial_lan_share));
+        let player_snapshot = Arc::new(Mutex::new(WebPlayerSnapshot::default()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // Spawn TCP HTTP server loop
         let tcp_db = Arc::clone(&db);
         let tcp_id = identity.clone();
         let tcp_lan_share = Arc::clone(&lan_share_enabled);
+        let tcp_snapshot = Arc::clone(&player_snapshot);
         let tcp_lan_ip = lan_ip.clone();
         let mut tcp_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -96,9 +121,21 @@ impl FriendNodeServer {
                         let db_c = Arc::clone(&tcp_db);
                         let id_c = tcp_id.clone();
                         let share_c = Arc::clone(&tcp_lan_share);
+                        let snap_c = Arc::clone(&tcp_snapshot);
+                        let cmd_c = cmd_tx.clone();
                         let ip_c = tcp_lan_ip.clone();
                         tokio::spawn(async move {
-                            let _ = handle_connection(stream, db_c, id_c, share_c, ip_c, port).await;
+                            let _ = handle_connection(
+                                stream,
+                                db_c,
+                                id_c,
+                                share_c,
+                                snap_c,
+                                cmd_c,
+                                ip_c,
+                                port,
+                            )
+                            .await;
                         });
                     }
                 }
@@ -147,8 +184,19 @@ impl FriendNodeServer {
             lan_ip,
             identity,
             lan_share_enabled,
+            player_snapshot,
             shutdown_tx,
         })
+    }
+
+    pub fn update_player_snapshot(&self, snap: WebPlayerSnapshot) {
+        if let Ok(mut guard) = self.player_snapshot.lock() {
+            *guard = snap;
+        }
+    }
+
+    pub fn web_url(&self) -> String {
+        format!("http://{}:{}", self.lan_ip, self.port)
     }
 
     pub fn ticket(&self) -> PeerTicket {
@@ -183,11 +231,14 @@ async fn bind_first_available_port(start: u16, end: u16) -> Result<TcpListener> 
     Ok(TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: TcpStream,
     db: Arc<Mutex<Database>>,
     identity: NodeIdentity,
     lan_share_enabled: Arc<AtomicBool>,
+    player_snapshot: Arc<Mutex<WebPlayerSnapshot>>,
+    cmd_tx: Option<mpsc::UnboundedSender<WebRemoteCommand>>,
     lan_ip: String,
     port: u16,
 ) -> Result<()> {
@@ -222,14 +273,17 @@ async fn handle_connection(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let raw_target = parts.next().unwrap_or("");
-    let path = raw_target.split('?').next().unwrap_or(raw_target);
+    let (path, query_opt) = match raw_target.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (raw_target, None),
+    };
 
-    if method != "GET" {
+    if method != "GET" && method != "POST" {
         write_simple_response(
             &mut stream,
             "405 Method Not Allowed",
             "text/plain",
-            b"Only GET supported",
+            b"Only GET/POST supported",
         )
         .await?;
         return Ok(());
@@ -238,6 +292,7 @@ async fn handle_connection(
     let mut token_hdr: Option<String> = None;
     let mut range_hdr: Option<String> = None;
     let mut host_hdr: Option<String> = None;
+    let mut content_len: usize = 0;
 
     for line in lines {
         if let Some((name, val)) = line.split_once(':') {
@@ -247,12 +302,94 @@ async fn handle_connection(
                 "x-peer-token" => token_hdr = Some(v),
                 "range" => range_hdr = Some(v),
                 "host" => host_hdr = Some(v),
+                "content-length" => content_len = v.parse::<usize>().unwrap_or(0),
                 _ => {}
             }
         }
     }
 
-    if path == "/api/v1/lan-ticket" {
+    let req_body = if method == "POST" && content_len > 0 {
+        if content_len > MAX_CONTROL_BODY_BYTES {
+            write_simple_response(
+                &mut stream,
+                "413 Payload Too Large",
+                "text/plain",
+                b"Body too large",
+            )
+            .await?;
+            return Ok(());
+        }
+        let already = &head_buf[header_end + 4..];
+        let mut body = Vec::with_capacity(content_len);
+        body.extend_from_slice(&already[..already.len().min(content_len)]);
+        while body.len() < content_len {
+            let mut chunk = [0u8; 4096];
+            let need = (content_len - body.len()).min(chunk.len());
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk[..need]))
+                .await
+                .map_err(|_| anyhow::anyhow!("Body read timeout"))??;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        body
+    } else {
+        Vec::new()
+    };
+
+    if method == "GET" {
+        match path {
+            "/" | "/index.html" => {
+                write_simple_response(
+                    &mut stream,
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    webui::INDEX_HTML.as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+            "/manifest.json" => {
+                write_simple_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/manifest+json; charset=utf-8",
+                    webui::MANIFEST_JSON.as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+            "/icon.svg" => {
+                write_simple_response(
+                    &mut stream,
+                    "200 OK",
+                    "image/svg+xml",
+                    webui::ICON_SVG.as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    let effective_endpoint = host_hdr
+        .as_deref()
+        .and_then(|h| {
+            let clean = h.trim();
+            (!clean.is_empty() && !clean.contains('/') && !clean.chars().any(char::is_whitespace))
+                .then(|| {
+                    if clean.contains(':') {
+                        clean.to_string()
+                    } else {
+                        format!("{clean}:{port}")
+                    }
+                })
+        })
+        .unwrap_or_else(|| format!("{lan_ip}:{port}"));
+
+    if method == "GET" && path == "/api/v1/lan-ticket" {
         if !lan_share_enabled.load(Ordering::Relaxed) {
             write_simple_response(
                 &mut stream,
@@ -263,25 +400,11 @@ async fn handle_connection(
             .await?;
             return Ok(());
         }
-        let endpoint = host_hdr
-            .as_deref()
-            .and_then(|h| {
-                let clean = h.trim();
-                (!clean.is_empty() && !clean.contains('/') && !clean.chars().any(char::is_whitespace))
-                    .then(|| {
-                        if clean.contains(':') {
-                            clean.to_string()
-                        } else {
-                            format!("{clean}:{port}")
-                        }
-                    })
-            })
-            .unwrap_or_else(|| format!("{lan_ip}:{port}"));
 
         let ticket = PeerTicket {
             node_id: identity.node_id,
             node_name: identity.node_name,
-            endpoint,
+            endpoint: effective_endpoint,
             auth_token: identity.auth_token,
         };
         let body = serde_json::to_vec(&ticket)?;
@@ -289,8 +412,12 @@ async fn handle_connection(
         return Ok(());
     }
 
-    // All remaining endpoints require valid X-Peer-Token
-    let supplied = token_hdr.as_deref().unwrap_or("");
+    // All remaining endpoints require valid token (X-Peer-Token header or ?token=... query param)
+    let query_tok = query_opt.and_then(|q| extract_query_param(q, "token"));
+    let supplied = token_hdr
+        .as_deref()
+        .or(query_tok.as_deref())
+        .unwrap_or("");
     if !verify_token_ct(&identity.auth_token, supplied) {
         write_simple_response(
             &mut stream,
@@ -302,12 +429,28 @@ async fn handle_connection(
         return Ok(());
     }
 
+    if method == "POST" && path == "/api/v1/control" {
+        let Ok(cmd) = serde_json::from_slice::<WebRemoteCommand>(&req_body) else {
+            write_simple_response(&mut stream, "400 Bad Request", "text/plain", b"Invalid JSON command")
+                .await?;
+            return Ok(());
+        };
+        apply_web_control_command(&db, &cmd, cmd_tx.as_ref())?;
+        write_simple_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#).await?;
+        return Ok(());
+    }
+
+    if method != "GET" {
+        write_simple_response(&mut stream, "404 Not Found", "text/plain", b"Not found").await?;
+        return Ok(());
+    }
+
     if path == "/api/v1/info" {
-        let catalog = build_local_catalog(&db, &identity)?;
+        let catalog = build_local_catalog(&db, &identity, false)?;
         let info = NodeInfoDto {
             node_id: identity.node_id,
             node_name: identity.node_name,
-            endpoint: format!("{lan_ip}:{port}"),
+            endpoint: effective_endpoint,
             track_count: catalog.tracks.len(),
             playlist_count: catalog.playlists.len(),
         };
@@ -317,9 +460,46 @@ async fn handle_connection(
     }
 
     if path == "/api/v1/catalog" {
-        let catalog = build_local_catalog(&db, &identity)?;
+        let include_peer = query_opt
+            .and_then(|q| extract_query_param(q, "include_peer"))
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let catalog = build_local_catalog(&db, &identity, include_peer)?;
         let body = serde_json::to_vec(&catalog)?;
         write_simple_response(&mut stream, "200 OK", "application/json", &body).await?;
+        return Ok(());
+    }
+
+    if path == "/api/v1/search" {
+        let q = query_opt
+            .and_then(|qs| extract_query_param(qs, "q"))
+            .unwrap_or_default();
+        let results = search_playable_tracks(&db, &q)?;
+        let body = serde_json::to_vec(&results)?;
+        write_simple_response(&mut stream, "200 OK", "application/json", &body).await?;
+        return Ok(());
+    }
+
+    if path == "/api/v1/state" {
+        let state = build_web_state(
+            &db,
+            &identity,
+            &effective_endpoint,
+            lan_share_enabled.load(Ordering::Relaxed),
+            &player_snapshot,
+        )?;
+        let body = serde_json::to_vec(&state)?;
+        write_simple_response(&mut stream, "200 OK", "application/json", &body).await?;
+        return Ok(());
+    }
+
+    if let Some(id_str) = path.strip_prefix("/api/v1/cover/") {
+        let Ok(track_id) = id_str.parse::<i64>() else {
+            write_simple_response(&mut stream, "400 Bad Request", "text/plain", b"Invalid track id")
+                .await?;
+            return Ok(());
+        };
+        serve_track_cover(&mut stream, &db, track_id).await?;
         return Ok(());
     }
 
@@ -337,7 +517,11 @@ async fn handle_connection(
     Ok(())
 }
 
-fn build_local_catalog(db: &Arc<Mutex<Database>>, identity: &NodeIdentity) -> Result<RemoteCatalogDto> {
+fn build_local_catalog(
+    db: &Arc<Mutex<Database>>,
+    identity: &NodeIdentity,
+    include_peer: bool,
+) -> Result<RemoteCatalogDto> {
     let guard = db
         .lock()
         .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
@@ -347,8 +531,8 @@ fn build_local_catalog(db: &Arc<Mutex<Database>>, identity: &NodeIdentity) -> Re
     let mut tracks = Vec::new();
 
     for t in all_tracks {
-        // Avoid echo loops re-exporting another peer's tracks, and only expose files existing locally.
-        if matches!(t.source, TrackSource::Peer { .. }) {
+        // Avoid echo loops re-exporting another peer's tracks on P2P sync, while allowing Web UI view with include_peer=1.
+        if !include_peer && matches!(t.source, TrackSource::Peer { .. }) {
             continue;
         }
         let Some(p) = t.source.playable_path() else {
@@ -358,17 +542,7 @@ fn build_local_catalog(db: &Arc<Mutex<Database>>, identity: &NodeIdentity) -> Re
             continue;
         }
         allowed_ids.insert(t.id);
-        tracks.push(RemoteTrackDto {
-            id: t.id,
-            title: t.title,
-            artist: t.artist,
-            album: t.album,
-            year: t.year,
-            track_number: t.track_number,
-            duration_secs: t.duration_secs,
-            file_size_bytes: t.file_size_bytes,
-            format: t.format,
-        });
+        tracks.push(track_to_remote_dto(&t));
     }
 
     let raw_playlists = guard.list_playlists()?;
@@ -397,6 +571,178 @@ fn build_local_catalog(db: &Arc<Mutex<Database>>, identity: &NodeIdentity) -> Re
     })
 }
 
+fn search_playable_tracks(db: &Arc<Mutex<Database>>, query: &str) -> Result<Vec<RemoteTrackDto>> {
+    let guard = db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
+    let rows = guard.search_tracks_fts(query, 300)?;
+    Ok(rows
+        .into_iter()
+        .filter(|t| {
+            t.source
+                .playable_path()
+                .map(|p| Path::new(p).exists())
+                .unwrap_or(false)
+        })
+        .map(|t| track_to_remote_dto(&t))
+        .collect())
+}
+
+fn build_web_state(
+    db: &Arc<Mutex<Database>>,
+    identity: &NodeIdentity,
+    endpoint: &str,
+    lan_share: bool,
+    player_snapshot: &Arc<Mutex<WebPlayerSnapshot>>,
+) -> Result<WebStateDto> {
+    let ticket_uri = PeerTicket {
+        node_id: identity.node_id.clone(),
+        node_name: identity.node_name.clone(),
+        endpoint: endpoint.to_string(),
+        auth_token: identity.auth_token.clone(),
+    }
+    .to_uri();
+
+    let (peers, playlists) = {
+        let guard = db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
+        let peers: Vec<WebPeerSummary> = guard
+            .load_paired_peers()?
+            .into_iter()
+            .map(|p| WebPeerSummary {
+                node_id: p.node_id,
+                node_name: p.node_name,
+                endpoint: p.endpoint,
+                track_count: p.track_count,
+                playlist_count: p.playlist_count,
+            })
+            .collect();
+        let mut playlists = Vec::new();
+        for pl in guard.list_playlists()? {
+            let track_ids: Vec<i64> = guard
+                .get_playlist_tracks(pl.id)?
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            playlists.push(WebPlaylistSummary {
+                id: pl.id,
+                name: pl.name,
+                pinned: pl.pinned,
+                track_ids,
+            });
+        }
+        (peers, playlists)
+    };
+
+    let player = player_snapshot
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+
+    Ok(WebStateDto {
+        node_id: identity.node_id.clone(),
+        node_name: identity.node_name.clone(),
+        endpoint: endpoint.to_string(),
+        ticket_uri,
+        lan_share,
+        player,
+        peers,
+        playlists,
+    })
+}
+
+fn apply_web_control_command(
+    db: &Arc<Mutex<Database>>,
+    cmd: &WebRemoteCommand,
+    cmd_tx: Option<&mpsc::UnboundedSender<WebRemoteCommand>>,
+) -> Result<()> {
+    let forwarded = match cmd {
+        WebRemoteCommand::TogglePin { track_id } => {
+            let guard = db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
+            let next = guard.toggle_track_pin(*track_id).unwrap_or(false);
+            WebRemoteCommand::SyncRefresh {
+                message: Some(format!("Web pin -> {next} (#{track_id})")),
+            }
+        }
+        WebRemoteCommand::CreatePlaylist { name, track_id } => {
+            let clean = name.trim();
+            if !clean.is_empty() {
+                let guard = db
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
+                let pl_id = guard.create_playlist(clean)?;
+                if let Some(tid) = track_id {
+                    guard.add_track_to_playlist(pl_id, *tid)?;
+                }
+            }
+            WebRemoteCommand::SyncRefresh {
+                message: Some(format!("Web playlist: {}", name.trim())),
+            }
+        }
+        WebRemoteCommand::AddToPlaylist {
+            playlist_id,
+            track_id,
+        } => {
+            let guard = db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
+            guard.add_track_to_playlist(*playlist_id, *track_id)?;
+            WebRemoteCommand::SyncRefresh {
+                message: Some(format!("Web +playlist (#{track_id})")),
+            }
+        }
+        other => other.clone(),
+    };
+
+    if let Some(tx) = cmd_tx {
+        let _ = tx.send(forwarded);
+    }
+    Ok(())
+}
+
+async fn serve_track_cover(
+    stream: &mut TcpStream,
+    db: &Arc<Mutex<Database>>,
+    track_id: i64,
+) -> Result<()> {
+    let cover_opt = {
+        let guard = db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
+        guard.get_track(track_id)?.and_then(|t| t.cover_path)
+    };
+
+    if let Some(cover_path) = cover_opt {
+        let p = Path::new(&cover_path);
+        if let Ok(meta) = tokio::fs::symlink_metadata(p).await {
+            if !meta.file_type().is_symlink() && meta.len() > 0 && meta.len() <= MAX_COVER_BYTES {
+                if let Ok(bytes) = tokio::fs::read(p).await {
+                    let mime = match p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "png" => "image/png",
+                        "webp" => "image/webp",
+                        "svg" => "image/svg+xml",
+                        _ => "image/jpeg",
+                    };
+                    write_simple_response(stream, "200 OK", mime, &bytes).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    write_simple_response(stream, "200 OK", "image/svg+xml", webui::ICON_SVG.as_bytes()).await?;
+    Ok(())
+}
+
 async fn serve_track_stream(
     stream: &mut TcpStream,
     db: &Arc<Mutex<Database>>,
@@ -414,9 +760,6 @@ async fn serve_track_stream(
             .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
         match guard.get_track(track_id)? {
             None => LookupOutcome::ErrMsg(b"Track not found"),
-            Some(track) if matches!(track.source, TrackSource::Peer { .. }) => {
-                LookupOutcome::ErrMsg(b"Track not locally hosted")
-            }
             Some(track) => match track.source.playable_path() {
                 Some(p) => LookupOutcome::OkPath(p.to_string()),
                 None => LookupOutcome::ErrMsg(b"Track file unavailable"),
@@ -440,7 +783,7 @@ async fn serve_track_stream(
     let total_len = meta.len();
 
     if total_len == 0 {
-        write_simple_response(stream, "200 OK", "application/octet-stream", &[]).await?;
+        write_simple_response(stream, "200 OK", audio_mime_type(&file_path), &[]).await?;
         return Ok(());
     }
 
@@ -457,8 +800,9 @@ async fn serve_track_stream(
     };
 
     let content_len = end - start + 1;
+    let mime = audio_mime_type(&file_path);
     let mut header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Length: {content_len}\r\nConnection: close\r\n"
+        "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nAccept-Ranges: bytes\r\nContent-Length: {content_len}\r\nConnection: close\r\n"
     );
     if status.starts_with("206") {
         header.push_str(&format!("Content-Range: bytes {start}-{end}/{total_len}\r\n"));
@@ -514,6 +858,24 @@ fn parse_byte_range(hdr: &str, total_len: u64) -> Option<Option<(u64, u64)>> {
         parsed_end.min(total_len - 1)
     };
     Some(Some((start, end)))
+}
+
+fn audio_mime_type(path: &str) -> &'static str {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "flac" => "audio/flac",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        "m4a" | "mp4" => "audio/mp4",
+        "aac" => "audio/aac",
+        "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    }
 }
 
 async fn write_simple_response(

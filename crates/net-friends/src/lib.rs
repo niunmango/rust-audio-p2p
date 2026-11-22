@@ -1,13 +1,15 @@
-//! Lightweight serverless friend-to-friend & LAN P2P audio sharing.
+//! Lightweight serverless friend-to-friend & LAN P2P audio sharing + Web UI / PWA.
 
 pub mod client;
 pub mod protocol;
 pub mod server;
+pub mod webui;
 
 pub use client::FriendNodeClient;
 pub use protocol::{
-    detect_lan_ip, verify_token_ct, NodeIdentity, NodeInfoDto, PeerTicket, RemoteCatalogDto,
-    RemotePlaylistDto, RemoteTrackDto, DEFAULT_P2P_PORT, LAN_DISCOVERY_PORT,
+    detect_lan_ip, track_to_remote_dto, verify_token_ct, NodeIdentity, NodeInfoDto, PeerTicket,
+    RemoteCatalogDto, RemotePlaylistDto, RemoteTrackDto, WebPeerSummary, WebPlayerSnapshot,
+    WebPlaylistSummary, WebRemoteCommand, WebStateDto, DEFAULT_P2P_PORT, LAN_DISCOVERY_PORT,
 };
 pub use server::FriendNodeServer;
 
@@ -148,6 +150,141 @@ mod tests {
             .unwrap();
         assert_eq!(range_resp.status().as_u16(), 206);
         assert_eq!(range_resp.bytes().await.unwrap().as_ref(), &payload[5..15]);
+
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn test_webui_pwa_search_query_token_and_remote_control() {
+        let temp = std::env::temp_dir().join(format!(
+            "rust_audio_webui_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let audio_file = temp.join("track.flac");
+        let payload = b"fLaC_web_stream_test_bytes";
+        std::fs::write(&audio_file, payload).unwrap();
+
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let identity = NodeIdentity::load_or_create(&db.lock().unwrap()).unwrap();
+        let tid = db
+            .lock()
+            .unwrap()
+            .upsert_track(&Track {
+                id: 0,
+                title: "Web Song".to_string(),
+                artist: "Web Artist".to_string(),
+                album: "Web Album".to_string(),
+                year: Some(2025),
+                track_number: Some(1),
+                duration_secs: Some(180),
+                file_size_bytes: payload.len() as u64,
+                format: "flac".to_string(),
+                cover_path: None,
+                source: TrackSource::LocalFile {
+                    path: audio_file.to_string_lossy().to_string(),
+                },
+                pinned: false,
+            })
+            .unwrap();
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = FriendNodeServer::start_with_full_options(
+            Arc::clone(&db),
+            identity.clone(),
+            Some(0),
+            None,
+            Some(cmd_tx),
+        )
+        .await
+        .unwrap();
+
+        let base = format!("http://127.0.0.1:{}", server.port);
+        let http = reqwest::Client::new();
+
+        // 1. Public Web UI & PWA assets
+        let index_res = http.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(index_res.status().as_u16(), 200);
+        let html = index_res.text().await.unwrap();
+        assert!(html.contains("rust-audio-p2p"));
+        assert!(html.contains("/manifest.json"));
+
+        let manifest_res = http.get(format!("{base}/manifest.json")).send().await.unwrap();
+        assert_eq!(manifest_res.status().as_u16(), 200);
+        assert!(manifest_res.text().await.unwrap().contains("rust-audio"));
+
+        // 2. Query-param token auth for browser <audio>, search, and cover
+        let search_res = http
+            .get(format!("{base}/api/v1/search?q=Web&token={}", identity.auth_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(search_res.status().as_u16(), 200);
+        let found: Vec<RemoteTrackDto> = search_res.json().await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, tid);
+
+        let stream_res = http
+            .get(format!("{base}/api/v1/stream/{tid}?token={}", identity.auth_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stream_res.status().as_u16(), 200);
+        assert_eq!(stream_res.headers().get("content-type").unwrap(), "audio/flac");
+        assert_eq!(stream_res.bytes().await.unwrap().as_ref(), payload);
+
+        let cover_res = http
+            .get(format!("{base}/api/v1/cover/{tid}?token={}", identity.auth_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cover_res.status().as_u16(), 200);
+
+        // 3. POST /api/v1/control mutates DB + forwards playback command
+        let ctrl_pl = http
+            .post(format!("{base}/api/v1/control"))
+            .header("X-Peer-Token", &identity.auth_token)
+            .json(&WebRemoteCommand::CreatePlaylist {
+                name: "From Web".to_string(),
+                track_id: Some(tid),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ctrl_pl.status().as_u16(), 200);
+
+        let ctrl_play = http
+            .post(format!("{base}/api/v1/control"))
+            .header("X-Peer-Token", &identity.auth_token)
+            .json(&WebRemoteCommand::PlayTrack { track_id: tid })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ctrl_play.status().as_u16(), 200);
+
+        let state_res = http
+            .get(format!("{base}/api/v1/state"))
+            .header("X-Peer-Token", &identity.auth_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(state_res.status().as_u16(), 200);
+        let state_dto: WebStateDto = state_res.json().await.unwrap();
+        assert_eq!(state_dto.playlists.len(), 1);
+        assert_eq!(state_dto.playlists[0].name, "From Web");
+        assert_eq!(state_dto.playlists[0].track_ids, vec![tid]);
+
+        let ev1 = cmd_rx.try_recv().unwrap();
+        assert!(matches!(ev1, WebRemoteCommand::SyncRefresh { .. }));
+        let ev2 = cmd_rx.try_recv().unwrap();
+        assert_eq!(ev2, WebRemoteCommand::PlayTrack { track_id: tid });
 
         server.shutdown();
         let _ = std::fs::remove_dir_all(&temp);

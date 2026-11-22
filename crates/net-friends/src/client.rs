@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 
 use crate::protocol::{
-    sanitize_ext, sanitize_id, PeerTicket, RemoteCatalogDto, DISCOVER_REQ_MSG,
+    sanitize_ext, sanitize_id, PeerTicket, RemoteCatalogDto, WebStateDto, DISCOVER_REQ_MSG,
     DISCOVER_RESP_PREFIX, LAN_DISCOVERY_PORT,
 };
 
@@ -196,6 +196,38 @@ impl FriendNodeClient {
         drop(out_file);
         tokio::fs::rename(&tmp_path, &target_path).await?;
         Ok(target_path)
+    }
+
+    pub async fn verify_web_ui(&self, base_url: &str, token: &str) -> Result<WebStateDto> {
+        let index_resp = self
+            .http
+            .get(base_url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        anyhow::ensure!(
+            index_resp.status().is_success(),
+            "Web UI returned HTTP {}",
+            index_resp.status().as_u16()
+        );
+        let html_bytes = read_limited_bytes(index_resp, 2 * 1024 * 1024).await?;
+        let html = String::from_utf8_lossy(&html_bytes);
+        anyhow::ensure!(html.contains("rust-audio-p2p"), "Unexpected Web UI body");
+
+        let state_resp = self
+            .http
+            .get(format!("{base_url}/api/v1/state"))
+            .header("X-Peer-Token", token)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        anyhow::ensure!(
+            state_resp.status().is_success(),
+            "Web /api/v1/state returned HTTP {}",
+            state_resp.status().as_u16()
+        );
+        let state_bytes = read_limited_bytes(state_resp, 4 * 1024 * 1024).await?;
+        Ok(serde_json::from_slice(&state_bytes)?)
     }
 }
 

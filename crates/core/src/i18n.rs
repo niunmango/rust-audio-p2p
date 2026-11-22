@@ -398,6 +398,13 @@ impl I18n {
         self.t("☁=Stream/Cache | ✓=Cacheado", "☁=Stream/Cache | ✓=Cached")
     }
 
+    pub fn friends_web_url_label(&self, url: &str) -> String {
+        match self.lang {
+            Language::Es => format!("Web UI / PWA: {url}"),
+            Language::En => format!("Web UI / PWA: {url}"),
+        }
+    }
+
     pub fn language_label(&self) -> String {
         let mode = match self.pref {
             LanguagePreference::Auto => self.t("Auto", "Auto"),
