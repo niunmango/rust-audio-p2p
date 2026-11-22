@@ -44,6 +44,44 @@ pub fn redact_url_secrets(input: &str) -> String {
         pos = val_end;
     }
 
+    let first_pass = if pos == 0 {
+        input.to_string()
+    } else {
+        out.push_str(&input[pos..]);
+        out
+    };
+    redact_rap2p_fragments(&first_pass)
+}
+
+fn redact_rap2p_fragments(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut pos = 0usize;
+
+    while let Some(rel) = lower[pos..].find("rap2p://") {
+        let uri_start = pos + rel;
+        let uri_end = input[uri_start..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '>' | ')'))
+            .map(|off| uri_start + off)
+            .unwrap_or(input.len());
+
+        if let Some(hash_rel) = input[uri_start..uri_end].find('#') {
+            let tok_start = uri_start + hash_rel + 1;
+            let tok_end = input[tok_start..uri_end]
+                .find('?')
+                .map(|off| tok_start + off)
+                .unwrap_or(uri_end);
+            out.push_str(&input[pos..tok_start]);
+            if tok_end > tok_start {
+                out.push_str("***");
+            }
+            pos = tok_end;
+        } else {
+            out.push_str(&input[pos..uri_end]);
+            pos = uri_end;
+        }
+    }
+
     if pos == 0 {
         return input.to_string();
     }
@@ -116,6 +154,7 @@ impl TorznabSearchProvider {
 
     pub fn with_urls(urls: Vec<String>, api_key: impl Into<String>) -> Self {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(6))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -580,6 +619,7 @@ pub struct InternetArchiveAudioProvider {
 impl InternetArchiveAudioProvider {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(6))
             .user_agent("rust-audio-p2p/0.1")
             .build()
@@ -892,6 +932,10 @@ mod tests {
         assert_eq!(
             redact_url_secrets("Almendra – ñ apikey=x"),
             "Almendra – ñ apikey=***"
+        );
+        assert_eq!(
+            redact_url_secrets("rap2p://192.168.1.10:4261#supersecret123?name=air"),
+            "rap2p://192.168.1.10:4261#***?name=air"
         );
     }
 }

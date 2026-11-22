@@ -186,6 +186,11 @@ MARKER="\$CACHE_ROOT/.extracted_ok"
 SELF_BIN="\$(readlink -f "\$0")"
 SELF_STAMP="\$(stat -c '%Y:%s' "\$SELF_BIN" 2>/dev/null || echo 1)"
 
+if [[ -e "\$CACHE_ROOT" ]] && { [[ -L "\$CACHE_ROOT" ]] || [[ ! -O "\$CACHE_ROOT" ]]; }; then
+  echo "ERROR: unsafe AppImage cache directory \$CACHE_ROOT" >&2
+  exit 1
+fi
+
 if [[ ! -f "\$MARKER" ]] || [[ "\$(cat "\$MARKER" 2>/dev/null || true)" != "\$SELF_STAMP" ]]; then
   rm -rf "\$CACHE_ROOT"
   mkdir -p "\$CACHE_ROOT"
@@ -193,6 +198,11 @@ if [[ ! -f "\$MARKER" ]] || [[ "\$(cat "\$MARKER" 2>/dev/null || true)" != "\$SE
   ARCHIVE_LINE=\$(awk '/^__APPIMAGE_ARCHIVE_BELOW__$/ {print NR + 1; exit 0;}' "\$SELF_BIN")
   tail -n +"\$ARCHIVE_LINE" "\$SELF_BIN" | tar --no-same-owner -xz -C "\$CACHE_ROOT"
   echo "\$SELF_STAMP" > "\$MARKER"
+fi
+
+if [[ -L "\$CACHE_ROOT" ]] || [[ ! -O "\$CACHE_ROOT" ]]; then
+  echo "ERROR: unsafe AppImage cache directory \$CACHE_ROOT" >&2
+  exit 1
 fi
 
 export ARGV0="\${ARGV0:-\$0}"

@@ -248,7 +248,13 @@ fn draw_track_table(
         .skip(start)
         .take(height.max(1))
         .map(|(i, t)| {
-            let pin_mark = if t.pinned { "★" } else { " " };
+            let marked = app.marked_track_ids.contains(&t.id);
+            let pin_mark = match (marked, t.pinned) {
+                (true, true) => "✓★",
+                (true, false) => "✓ ",
+                (false, true) => " ★",
+                (false, false) => "  ",
+            };
             let fmt_cell = match &t.source {
                 TrackSource::Peer { cached_path, .. } => {
                     let cached = cached_path
@@ -268,6 +274,8 @@ fn draw_track_table(
                     .bg(Color::DarkGray)
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
+            } else if marked {
+                Style::default().fg(Color::Yellow)
             } else if i == selected {
                 Style::default().fg(Color::Cyan)
             } else {
@@ -289,11 +297,17 @@ fn draw_track_table(
         Style::default()
     };
 
+    let marked_suffix = if app.marked_track_ids.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", app.i18n.marked_tracks_badge(app.marked_track_ids.len()))
+    };
+
     let table = Table::new(
         rows,
         [
-            Constraint::Length(4),
-            Constraint::Percentage(36),
+            Constraint::Length(5),
+            Constraint::Percentage(35),
             Constraint::Percentage(26),
             Constraint::Percentage(26),
             Constraint::Length(8),
@@ -304,7 +318,7 @@ fn draw_track_table(
         Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
-            .title(format!(" {title} ({}) ", tracks.len())),
+            .title(format!(" {title} ({}){marked_suffix} ", tracks.len())),
     );
     frame.render_widget(table, area);
     start
@@ -374,15 +388,22 @@ fn draw_playlists(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Length(3), Constraint::Min(4)])
         .split(cols[0]);
 
-    let cursor = if app.playlist_editing { "█" } else { "" };
-    let input_border = if app.playlist_editing {
+    let cursor = if app.playlist_editing || app.playlist_renaming { "█" } else { "" };
+    let input_border = if app.playlist_editing || app.playlist_renaming {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
+    let input_prefix = if app.playlist_renaming {
+        "Renombrar / Rename"
+    } else if app.playlist_editing {
+        "Nueva / New"
+    } else {
+        "[n] Nueva | [e] Renombrar"
+    };
     let new_pl = Paragraph::new(format!(
         "{}: {}{}",
-        if app.playlist_editing { "Nombre / Name" } else { "[n / Clic] Nueva / New" },
+        input_prefix,
         app.playlist_input,
         cursor
     ))
@@ -814,8 +835,13 @@ fn draw_playlist_picker_modal(frame: &mut Frame, app: &App) {
         .margin(1)
         .split(modal_area);
 
+    let picker_summary = if picker.tracks.len() == 1 {
+        format!("♪ {} — {}", picker.tracks[0].artist, picker.tracks[0].title)
+    } else {
+        format!("♪ {} pistas seleccionadas / tracks selected", picker.tracks.len())
+    };
     frame.render_widget(
-        Paragraph::new(format!("♪ {} — {}", picker.track.artist, picker.track.title))
+        Paragraph::new(picker_summary)
             .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         inner[0],
     );

@@ -309,10 +309,36 @@ fn draw_playlists(ui: &mut egui::Ui, state: &mut GuiState) {
             let _ = state.create_playlist_from_input();
         }
     });
+
+    if let Some(ren_id) = state.rename_playlist_id {
+        let mut do_save = false;
+        let mut do_cancel = false;
+        ui.horizontal(|ui| {
+            ui.label("✏");
+            let resp = ui.text_edit_singleline(&mut state.rename_playlist_input);
+            if (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                || ui.button("💾").clicked()
+            {
+                do_save = true;
+            }
+            if ui.button("✖").clicked() {
+                do_cancel = true;
+            }
+        });
+        if do_save {
+            let new_name = state.rename_playlist_input.clone();
+            let _ = state.rename_playlist(ren_id, &new_name);
+        } else if do_cancel {
+            state.rename_playlist_id = None;
+            state.rename_playlist_input.clear();
+        }
+    }
     ui.separator();
 
     let mut select_pl_idx: Option<usize> = None;
     let mut toggle_pl_pin: Option<(i64, String)> = None;
+    let mut start_rename: Option<(i64, String)> = None;
+    let mut delete_pl: Option<(i64, String)> = None;
 
     ui.columns(2, |cols| {
         cols[0].heading(format!(
@@ -329,6 +355,12 @@ fn draw_playlists(ui: &mut egui::Ui, state: &mut GuiState) {
                         let pin_icon = if pl.pinned { "★" } else { "☆" };
                         if ui.button(pin_icon).clicked() {
                             toggle_pl_pin = Some((pl.id, pl.name.clone()));
+                        }
+                        if ui.button("✏").clicked() {
+                            start_rename = Some((pl.id, pl.name.clone()));
+                        }
+                        if ui.button("🗑").clicked() {
+                            delete_pl = Some((pl.id, pl.name.clone()));
                         }
                         let selected = state.selected_playlist_idx == Some(i);
                         if ui
@@ -350,13 +382,24 @@ fn draw_playlists(ui: &mut egui::Ui, state: &mut GuiState) {
         let pinned = state.pinned_tracks.clone();
         draw_track_table(&mut cols[0], state, "pinned_grid", &pinned, false);
 
-        let pl_name = state
+        let active_pl = state
             .selected_playlist_idx
             .and_then(|i| state.playlists.get(i))
+            .cloned();
+        let pl_name = active_pl
+            .as_ref()
             .map(|p| p.name.as_str())
             .unwrap_or("—");
         cols[1].horizontal(|ui| {
             ui.heading(state.i18n.playlist_tracks_header(pl_name));
+            if let Some(ref pl) = active_pl {
+                if ui.button("✏").clicked() {
+                    start_rename = Some((pl.id, pl.name.clone()));
+                }
+                if ui.button("🗑").clicked() {
+                    delete_pl = Some((pl.id, pl.name.clone()));
+                }
+            }
         });
         let pl_tracks = state.selected_playlist_tracks.clone();
         if !pl_tracks.is_empty() && cols[1].button("▶ Play All").clicked() {
@@ -371,6 +414,13 @@ fn draw_playlists(ui: &mut egui::Ui, state: &mut GuiState) {
     }
     if let Some((pl_id, name)) = toggle_pl_pin {
         let _ = state.toggle_playlist_pin(pl_id, &name);
+    }
+    if let Some((pl_id, name)) = start_rename {
+        state.rename_playlist_id = Some(pl_id);
+        state.rename_playlist_input = name;
+    }
+    if let Some((pl_id, name)) = delete_pl {
+        let _ = state.delete_playlist(pl_id, &name);
     }
 }
 
@@ -695,14 +745,27 @@ fn draw_track_table(
     let mut action: Option<TrackRowAction> = None;
     let current_key = state.queue.current().map(|t| t.source.unique_key());
 
+    if !state.marked_track_ids.is_empty() {
+        ui.horizontal(|ui| {
+            ui.strong(state.i18n.marked_tracks_badge(state.marked_track_ids.len()));
+            if ui.button("+ Playlist").clicked() {
+                state.open_batch_playlist_picker();
+            }
+            if ui.button("✖").clicked() {
+                state.marked_track_ids.clear();
+            }
+        });
+    }
+
     egui::ScrollArea::vertical()
         .id_salt(id_salt)
         .auto_shrink([false; 2])
         .show(ui, |ui| {
             egui::Grid::new(format!("{id_salt}_grid"))
                 .striped(true)
-                .num_columns(if show_remove { 7 } else { 6 })
+                .num_columns(if show_remove { 8 } else { 7 })
                 .show(ui, |ui| {
+                    ui.strong("✓");
                     ui.strong("");
                     ui.strong(state.i18n.col_pin());
                     ui.strong(state.i18n.col_title());
@@ -716,6 +779,14 @@ fn draw_track_table(
 
                     for (idx, tr) in tracks.iter().enumerate() {
                         let is_cur = current_key.as_deref() == Some(tr.source.unique_key().as_str());
+                        let mut marked = state.marked_track_ids.contains(&tr.id);
+                        if ui.checkbox(&mut marked, "").changed() {
+                            if marked {
+                                state.marked_track_ids.insert(tr.id);
+                            } else {
+                                state.marked_track_ids.remove(&tr.id);
+                            }
+                        }
                         if ui.button(if is_cur { "🔊" } else { "▶" }).clicked() {
                             action = Some(TrackRowAction::Play(idx));
                         }
@@ -768,7 +839,7 @@ fn draw_track_table(
             }
             TrackRowAction::OpenPlaylistPicker(tr) => {
                 state.playlist_picker = Some(PlaylistPickerModal {
-                    track: tr,
+                    tracks: vec![tr],
                     new_name: String::new(),
                 });
             }
@@ -787,16 +858,19 @@ fn draw_playlist_picker_modal(ctx: &egui::Context, state: &mut GuiState) {
     let mut add_existing: Option<(i64, String)> = None;
     let mut create_and_add: Option<String> = None;
 
+    let picker_summary = if picker.tracks.len() == 1 {
+        format!("♪ {} — {}", picker.tracks[0].artist, picker.tracks[0].title)
+    } else {
+        format!("♪ {} pistas seleccionadas / tracks selected", picker.tracks.len())
+    };
+
     egui::Window::new(state.i18n.playlist_picker_title())
         .open(&mut keep_open)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.label(
-                RichText::new(format!("♪ {} — {}", picker.track.artist, picker.track.title))
-                    .strong(),
-            );
+            ui.label(RichText::new(picker_summary).strong());
             ui.separator();
             for pl in &state.playlists {
                 if ui
@@ -817,9 +891,9 @@ fn draw_playlist_picker_modal(ctx: &egui::Context, state: &mut GuiState) {
         });
 
     if let Some((pl_id, pl_name)) = add_existing {
-        let _ = state.add_track_to_playlist(pl_id, &pl_name, &picker.track);
+        let _ = state.add_tracks_to_playlist(pl_id, &pl_name, &picker.tracks);
     } else if let Some(name) = create_and_add {
-        let _ = state.create_playlist_and_add_track(&name, &picker.track);
+        let _ = state.create_playlist_and_add_tracks(&name, &picker.tracks);
     } else if keep_open {
         state.playlist_picker = Some(picker);
     }

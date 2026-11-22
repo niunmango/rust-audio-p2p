@@ -9,8 +9,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 
 use crate::protocol::{
-    sanitize_ext, sanitize_id, PeerTicket, RemoteCatalogDto, WebStateDto, DISCOVER_REQ_MSG,
-    DISCOVER_RESP_PREFIX, LAN_DISCOVERY_PORT,
+    sanitize_ext, sanitize_id, validate_peer_endpoint, PeerTicket, RemoteCatalogDto, WebStateDto,
+    DISCOVER_REQ_MSG, DISCOVER_RESP_PREFIX, LAN_DISCOVERY_PORT,
 };
 
 const MAX_CATALOG_JSON_BYTES: usize = 16 * 1024 * 1024;
@@ -30,6 +30,7 @@ impl Default for FriendNodeClient {
 impl FriendNodeClient {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(120))
             .build()
@@ -155,6 +156,8 @@ impl FriendNodeClient {
         format: &str,
         cache_dir: &Path,
     ) -> Result<PathBuf> {
+        anyhow::ensure!(remote_track_id >= 0, "Invalid negative remote_track_id");
+        validate_peer_endpoint(&peer.endpoint)?;
         tokio::fs::create_dir_all(cache_dir).await?;
         let safe_node = sanitize_id(&peer.node_id);
         let safe_ext = sanitize_ext(format);
@@ -180,6 +183,11 @@ impl FriendNodeClient {
         }
 
         let mut out_file = tokio::fs::File::create(&tmp_path).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).await;
+        }
         let mut total_written: u64 = 0;
 
         while let Some(chunk) = resp.chunk().await? {

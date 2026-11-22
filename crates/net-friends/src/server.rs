@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use rust_audio_core::{Database, TrackSource};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 
 use crate::protocol::{
     detect_lan_ip, extract_query_param, track_to_remote_dto, verify_token_ct, NodeIdentity,
@@ -23,7 +23,9 @@ use crate::webui;
 const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 const MAX_CONTROL_BODY_BYTES: usize = 64 * 1024;
 const MAX_COVER_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'\r\n";
 
 pub struct FriendNodeServer {
     pub port: u16,
@@ -99,12 +101,13 @@ impl FriendNodeServer {
         let player_snapshot = Arc::new(Mutex::new(WebPlayerSnapshot::default()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        // Spawn TCP HTTP server loop
+        // Spawn TCP HTTP server loop with bounded concurrency
         let tcp_db = Arc::clone(&db);
         let tcp_id = identity.clone();
         let tcp_lan_share = Arc::clone(&lan_share_enabled);
         let tcp_snapshot = Arc::clone(&player_snapshot);
         let tcp_lan_ip = lan_ip.clone();
+        let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
         let mut tcp_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             loop {
@@ -118,6 +121,10 @@ impl FriendNodeServer {
                         let Ok((stream, _peer_addr)) = accept_res else {
                             break;
                         };
+                        let Ok(permit) = Arc::clone(&conn_sem).try_acquire_owned() else {
+                            drop(stream);
+                            continue;
+                        };
                         let db_c = Arc::clone(&tcp_db);
                         let id_c = tcp_id.clone();
                         let share_c = Arc::clone(&tcp_lan_share);
@@ -125,6 +132,7 @@ impl FriendNodeServer {
                         let cmd_c = cmd_tx.clone();
                         let ip_c = tcp_lan_ip.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             let _ = handle_connection(
                                 stream,
                                 db_c,
@@ -292,6 +300,8 @@ async fn handle_connection(
     let mut token_hdr: Option<String> = None;
     let mut range_hdr: Option<String> = None;
     let mut host_hdr: Option<String> = None;
+    let mut origin_hdr: Option<String> = None;
+    let mut sec_fetch_site_hdr: Option<String> = None;
     let mut content_len: usize = 0;
 
     for line in lines {
@@ -302,10 +312,39 @@ async fn handle_connection(
                 "x-peer-token" => token_hdr = Some(v),
                 "range" => range_hdr = Some(v),
                 "host" => host_hdr = Some(v),
+                "origin" => origin_hdr = Some(v),
+                "sec-fetch-site" => sec_fetch_site_hdr = Some(v),
                 "content-length" => content_len = v.parse::<usize>().unwrap_or(0),
                 _ => {}
             }
         }
+    }
+
+    if !is_allowed_host_header(host_hdr.as_deref(), &lan_ip) {
+        write_simple_response(
+            &mut stream,
+            "403 Forbidden",
+            "text/plain",
+            b"Host header rejected (DNS rebinding protection)",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if !is_allowed_browser_origin(
+        path,
+        origin_hdr.as_deref(),
+        sec_fetch_site_hdr.as_deref(),
+        &lan_ip,
+    ) {
+        write_simple_response(
+            &mut stream,
+            "403 Forbidden",
+            "text/plain",
+            b"Cross-site browser request rejected",
+        )
+        .await?;
+        return Ok(());
     }
 
     let req_body = if method == "POST" && content_len > 0 {
@@ -376,16 +415,18 @@ async fn handle_connection(
 
     let effective_endpoint = host_hdr
         .as_deref()
-        .and_then(|h| {
-            let clean = h.trim();
-            (!clean.is_empty() && !clean.contains('/') && !clean.chars().any(char::is_whitespace))
-                .then(|| {
-                    if clean.contains(':') {
-                        clean.to_string()
-                    } else {
-                        format!("{clean}:{port}")
-                    }
-                })
+        .and_then(|h| extract_host_component(h.trim()))
+        .filter(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || *host == lan_ip
+                || host.parse::<IpAddr>().is_ok()
+        })
+        .map(|host| {
+            if host.contains(':') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            }
         })
         .unwrap_or_else(|| format!("{lan_ip}:{port}"));
 
@@ -517,6 +558,13 @@ async fn handle_connection(
     Ok(())
 }
 
+fn is_local_file_ready(source: &TrackSource) -> bool {
+    source
+        .playable_path()
+        .map(|p| Path::new(p).exists())
+        .unwrap_or(false)
+}
+
 fn build_local_catalog(
     db: &Arc<Mutex<Database>>,
     identity: &NodeIdentity,
@@ -526,19 +574,19 @@ fn build_local_catalog(
         .lock()
         .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
 
-    let all_tracks = guard.list_tracks(5000, 0)?;
+    let limit = if include_peer { 25_000 } else { 5_000 };
+    let all_tracks = guard.list_tracks(limit, 0)?;
     let mut allowed_ids = HashSet::new();
     let mut tracks = Vec::new();
 
     for t in all_tracks {
+        let is_peer = matches!(t.source, TrackSource::Peer { .. });
         // Avoid echo loops re-exporting another peer's tracks on P2P sync, while allowing Web UI view with include_peer=1.
-        if !include_peer && matches!(t.source, TrackSource::Peer { .. }) {
+        if !include_peer && is_peer {
             continue;
         }
-        let Some(p) = t.source.playable_path() else {
-            continue;
-        };
-        if !Path::new(p).exists() {
+        // Web UI (include_peer=true) must list uncached P2P tracks too so 1. Library search & play work across connected nodes.
+        if !is_peer && !is_local_file_ready(&t.source) {
             continue;
         }
         allowed_ids.insert(t.id);
@@ -578,12 +626,7 @@ fn search_playable_tracks(db: &Arc<Mutex<Database>>, query: &str) -> Result<Vec<
     let rows = guard.search_tracks_fts(query, 300)?;
     Ok(rows
         .into_iter()
-        .filter(|t| {
-            t.source
-                .playable_path()
-                .map(|p| Path::new(p).exists())
-                .unwrap_or(false)
-        })
+        .filter(|t| matches!(t.source, TrackSource::Peer { .. }) || is_local_file_ready(&t.source))
         .map(|t| track_to_remote_dto(&t))
         .collect())
 }
@@ -682,6 +725,49 @@ fn apply_web_control_command(
                 message: Some(format!("Web playlist: {}", name.trim())),
             }
         }
+        WebRemoteCommand::CreatePlaylistWithTracks { name, track_ids } => {
+            let clean = name.trim();
+            if !clean.is_empty() {
+                let guard = db
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
+                let pl_id = guard.create_playlist(clean)?;
+                if !track_ids.is_empty() {
+                    guard.add_tracks_to_playlist(pl_id, track_ids)?;
+                }
+            }
+            WebRemoteCommand::SyncRefresh {
+                message: Some(format!(
+                    "Web playlist: {} (+{})",
+                    name.trim(),
+                    track_ids.len()
+                )),
+            }
+        }
+        WebRemoteCommand::RenamePlaylist {
+            playlist_id,
+            new_name,
+        } => {
+            let clean = new_name.trim();
+            if !clean.is_empty() {
+                let guard = db
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
+                guard.rename_playlist(*playlist_id, clean)?;
+            }
+            WebRemoteCommand::SyncRefresh {
+                message: Some(format!("Web rename playlist #{playlist_id} -> {}", clean)),
+            }
+        }
+        WebRemoteCommand::DeletePlaylist { playlist_id } => {
+            let guard = db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
+            guard.delete_playlist(*playlist_id)?;
+            WebRemoteCommand::SyncRefresh {
+                message: Some(format!("Web delete playlist #{playlist_id}")),
+            }
+        }
         WebRemoteCommand::AddToPlaylist {
             playlist_id,
             track_id,
@@ -692,6 +778,30 @@ fn apply_web_control_command(
             guard.add_track_to_playlist(*playlist_id, *track_id)?;
             WebRemoteCommand::SyncRefresh {
                 message: Some(format!("Web +playlist (#{track_id})")),
+            }
+        }
+        WebRemoteCommand::AddTracksToPlaylist {
+            playlist_id,
+            track_ids,
+        } => {
+            let guard = db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
+            let added = guard.add_tracks_to_playlist(*playlist_id, track_ids)?;
+            WebRemoteCommand::SyncRefresh {
+                message: Some(format!("Web +playlist (+{added} tracks)")),
+            }
+        }
+        WebRemoteCommand::RemoveFromPlaylist {
+            playlist_id,
+            track_id,
+        } => {
+            let guard = db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
+            guard.remove_track_from_playlist(*playlist_id, *track_id)?;
+            WebRemoteCommand::SyncRefresh {
+                message: Some(format!("Web -playlist (#{track_id})")),
             }
         }
         other => other.clone(),
@@ -751,6 +861,11 @@ async fn serve_track_stream(
 ) -> Result<()> {
     enum LookupOutcome {
         OkPath(String),
+        FetchRemote {
+            track: rust_audio_core::Track,
+            peer: rust_audio_core::PairedPeer,
+            remote_track_id: i64,
+        },
         ErrMsg(&'static [u8]),
     }
 
@@ -760,20 +875,122 @@ async fn serve_track_stream(
             .map_err(|_| anyhow::anyhow!("Database mutex poisoned"))?;
         match guard.get_track(track_id)? {
             None => LookupOutcome::ErrMsg(b"Track not found"),
-            Some(track) => match track.source.playable_path() {
-                Some(p) => LookupOutcome::OkPath(p.to_string()),
-                None => LookupOutcome::ErrMsg(b"Track file unavailable"),
-            },
+            Some(track) => {
+                if let Some(p) = track.source.playable_path() {
+                    if Path::new(p).exists() {
+                        LookupOutcome::OkPath(p.to_string())
+                    } else if let TrackSource::Peer {
+                        ref node_id,
+                        remote_track_id,
+                        ..
+                    } = track.source
+                    {
+                        match guard
+                            .load_paired_peers()?
+                            .into_iter()
+                            .find(|pr| &pr.node_id == node_id)
+                        {
+                            Some(peer) => LookupOutcome::FetchRemote {
+                                track,
+                                peer,
+                                remote_track_id,
+                            },
+                            None => LookupOutcome::ErrMsg(b"Remote peer not paired"),
+                        }
+                    } else {
+                        LookupOutcome::OkPath(p.to_string())
+                    }
+                } else if let TrackSource::Peer {
+                    ref node_id,
+                    remote_track_id,
+                    ..
+                } = track.source
+                {
+                    match guard
+                        .load_paired_peers()?
+                        .into_iter()
+                        .find(|pr| &pr.node_id == node_id)
+                    {
+                        Some(peer) => LookupOutcome::FetchRemote {
+                            track,
+                            peer,
+                            remote_track_id,
+                        },
+                        None => LookupOutcome::ErrMsg(b"Remote peer not paired"),
+                    }
+                } else {
+                    LookupOutcome::ErrMsg(b"Track file unavailable")
+                }
+            }
         }
     };
 
     let file_path = match lookup {
         LookupOutcome::OkPath(p) => p,
+        LookupOutcome::FetchRemote {
+            mut track,
+            peer,
+            remote_track_id,
+        } => {
+            let cache_dir = rust_audio_core::AppPaths::resolve_default().cache_dir;
+            let client = crate::client::FriendNodeClient::new();
+            let Ok(downloaded) = client
+                .download_peer_track_to_cache(&peer, remote_track_id, &track.format, &cache_dir)
+                .await
+            else {
+                write_simple_response(
+                    stream,
+                    "502 Bad Gateway",
+                    "text/plain",
+                    b"Failed fetching track from remote P2P node",
+                )
+                .await?;
+                return Ok(());
+            };
+            let downloaded_str = downloaded.to_string_lossy().to_string();
+            let file_size = tokio::fs::metadata(&downloaded)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if let TrackSource::Peer {
+                ref mut cached_path,
+                ..
+            } = track.source
+            {
+                *cached_path = Some(downloaded_str.clone());
+            }
+            if let Ok(guard) = db.lock() {
+                let _ = guard.upsert_track(&track);
+                let _ = guard.upsert_cache_entry(
+                    &track.source.unique_key(),
+                    Some(track.id),
+                    &downloaded_str,
+                    file_size,
+                    track.pinned,
+                );
+            }
+            downloaded_str
+        }
         LookupOutcome::ErrMsg(msg) => {
             write_simple_response(stream, "404 Not Found", "text/plain", msg).await?;
             return Ok(());
         }
     };
+
+    if !is_supported_audio_ext(&file_path) {
+        write_simple_response(stream, "403 Forbidden", "text/plain", b"Unsupported audio type")
+            .await?;
+        return Ok(());
+    }
+
+    let Ok(smeta) = tokio::fs::symlink_metadata(&file_path).await else {
+        write_simple_response(stream, "404 Not Found", "text/plain", b"File missing on disk").await?;
+        return Ok(());
+    };
+    if !smeta.is_file() || smeta.file_type().is_symlink() {
+        write_simple_response(stream, "403 Forbidden", "text/plain", b"Symlinks not allowed").await?;
+        return Ok(());
+    }
 
     let Ok(mut file) = tokio::fs::File::open(&file_path).await else {
         write_simple_response(stream, "404 Not Found", "text/plain", b"File missing on disk").await?;
@@ -791,7 +1008,7 @@ async fn serve_track_stream(
         Some(Some((s, e))) => ("206 Partial Content", s, e),
         Some(None) => {
             let hdr = format!(
-                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total_len}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total_len}\r\n{SECURITY_HEADERS}Content-Length: 0\r\nConnection: close\r\n\r\n"
             );
             stream.write_all(hdr.as_bytes()).await?;
             return Ok(());
@@ -802,13 +1019,15 @@ async fn serve_track_stream(
     let content_len = end - start + 1;
     let mime = audio_mime_type(&file_path);
     let mut header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nAccept-Ranges: bytes\r\nContent-Length: {content_len}\r\nConnection: close\r\n"
+        "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nAccept-Ranges: bytes\r\n{SECURITY_HEADERS}Content-Length: {content_len}\r\nConnection: close\r\n"
     );
     if status.starts_with("206") {
         header.push_str(&format!("Content-Range: bytes {start}-{end}/{total_len}\r\n"));
     }
     header.push_str("\r\n");
-    stream.write_all(header.as_bytes()).await?;
+    tokio::time::timeout(Duration::from_secs(10), stream.write_all(header.as_bytes()))
+        .await
+        .map_err(|_| anyhow::anyhow!("Stream header write timeout"))??;
 
     if start > 0 {
         file.seek(SeekFrom::Start(start)).await?;
@@ -822,10 +1041,14 @@ async fn serve_track_stream(
         if n == 0 {
             break;
         }
-        stream.write_all(&buf[..n]).await?;
+        tokio::time::timeout(Duration::from_secs(10), stream.write_all(&buf[..n]))
+            .await
+            .map_err(|_| anyhow::anyhow!("Stream chunk write timeout"))??;
         remaining -= n as u64;
     }
-    stream.flush().await?;
+    tokio::time::timeout(Duration::from_secs(10), stream.flush())
+        .await
+        .map_err(|_| anyhow::anyhow!("Stream flush timeout"))??;
     Ok(())
 }
 
@@ -860,6 +1083,83 @@ fn parse_byte_range(hdr: &str, total_len: u64) -> Option<Option<(u64, u64)>> {
     Some(Some((start, end)))
 }
 
+fn extract_host_component(raw: &str) -> Option<&str> {
+    if raw.is_empty() || raw.contains('/') || raw.contains('@') || raw.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if raw.starts_with('[') {
+        let end = raw.find(']')?;
+        let host = &raw[1..end];
+        let rest = &raw[end + 1..];
+        if !rest.is_empty() {
+            let port_str = rest.strip_prefix(':')?;
+            if port_str.parse::<u16>().is_err() {
+                return None;
+            }
+        }
+        return Some(host);
+    }
+    if let Some((h, port_str)) = raw.rsplit_once(':') {
+        if !h.contains(':') && port_str.parse::<u16>().is_ok() {
+            return (!h.is_empty()).then_some(h);
+        }
+    }
+    Some(raw)
+}
+
+fn is_allowed_host_literal(host: &str, lan_ip: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host == lan_ip || host.parse::<IpAddr>().is_ok()
+}
+
+fn is_allowed_host_header(host_hdr: Option<&str>, lan_ip: &str) -> bool {
+    match host_hdr.map(str::trim).filter(|s| !s.is_empty()) {
+        None => true,
+        Some(h) => extract_host_component(h)
+            .map(|host| is_allowed_host_literal(host, lan_ip))
+            .unwrap_or(false),
+    }
+}
+
+fn is_allowed_browser_origin(
+    path: &str,
+    origin_hdr: Option<&str>,
+    sec_fetch_site: Option<&str>,
+    lan_ip: &str,
+) -> bool {
+    if path.starts_with("/api/v1/") {
+        if let Some(sfs) = sec_fetch_site.map(str::trim) {
+            if sfs.eq_ignore_ascii_case("cross-site") {
+                return false;
+            }
+        }
+    }
+    if let Some(orig) = origin_hdr.map(str::trim).filter(|s| !s.is_empty()) {
+        let Some(rest) = orig
+            .strip_prefix("http://")
+            .or_else(|| orig.strip_prefix("https://"))
+        else {
+            return false;
+        };
+        let authority = rest.split('/').next().unwrap_or("");
+        return extract_host_component(authority)
+            .map(|host| is_allowed_host_literal(host, lan_ip))
+            .unwrap_or(false);
+    }
+    true
+}
+
+fn is_supported_audio_ext(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "flac" | "mp3" | "ogg" | "oga" | "opus" | "m4a" | "mp4" | "aac" | "wav"
+    )
+}
+
 fn audio_mime_type(path: &str) -> &'static str {
     let ext = Path::new(path)
         .extension()
@@ -885,7 +1185,7 @@ async fn write_simple_response(
     body: &[u8],
 ) -> Result<()> {
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{SECURITY_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes()).await?;

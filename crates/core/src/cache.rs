@@ -89,16 +89,28 @@ impl LruCacheManager {
     fn sync_offline_pin_hardlink(&self, track_id: i64, src: &Path, prefix: &str, pinned: bool) {
         if let Some(name) = src.file_name() {
             let _ = std::fs::create_dir_all(&self.offline_pins_dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &self.offline_pins_dir,
+                    std::fs::Permissions::from_mode(0o700),
+                );
+            }
+            let safe_name = name.to_string_lossy().replace('/', "_");
             let link_path = self
                 .offline_pins_dir
-                .join(format!("{prefix}{}_{}", track_id, name.to_string_lossy()));
+                .join(format!("{prefix}{track_id}_{safe_name}"));
             if pinned {
-                if src.exists() && !link_path.exists() {
+                let is_regular = std::fs::symlink_metadata(src)
+                    .map(|m| m.is_file() && !m.file_type().is_symlink())
+                    .unwrap_or(false);
+                if is_regular && !link_path.exists() {
                     // Hardlink uses zero extra disk space on the same LV/filesystem.
                     let _ = std::fs::hard_link(src, &link_path);
                 }
-            } else if link_path.exists() {
-                let _ = std::fs::remove_file(&link_path);
+            } else {
+                safe_remove_in_dir(&self.offline_pins_dir, &link_path);
             }
         }
     }

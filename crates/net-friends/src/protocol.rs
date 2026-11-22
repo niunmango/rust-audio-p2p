@@ -1,5 +1,4 @@
-use std::net::UdpSocket;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::net::{IpAddr, UdpSocket};
 
 use anyhow::Result;
 use rust_audio_core::Database;
@@ -102,21 +101,16 @@ fn detect_hostname() -> String {
 
 fn random_hex(num_bytes: usize) -> String {
     let mut buf = vec![0u8; num_bytes];
-    if read_urandom(&mut buf).is_err() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0x5eed);
-        let pid = std::process::id() as u128;
-        let mut seed = nanos ^ (pid << 32) ^ 0x9e3779b97f4a7c15;
-        for b in &mut buf {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            *b = (seed & 0xff) as u8;
-        }
-    }
+    read_urandom(&mut buf).expect("OS CSPRNG /dev/urandom unavailable");
     buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn sanitize_display_text(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(256)
+        .collect()
 }
 
 fn read_urandom(buf: &mut [u8]) -> std::io::Result<()> {
@@ -147,6 +141,8 @@ pub struct RemoteTrackDto {
     pub format: String,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_node: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,7 +183,12 @@ pub enum WebRemoteCommand {
     ToggleAutoNext,
     TogglePin { track_id: i64 },
     CreatePlaylist { name: String, track_id: Option<i64> },
+    CreatePlaylistWithTracks { name: String, track_ids: Vec<i64> },
+    RenamePlaylist { playlist_id: i64, new_name: String },
+    DeletePlaylist { playlist_id: i64 },
     AddToPlaylist { playlist_id: i64, track_id: i64 },
+    AddTracksToPlaylist { playlist_id: i64, track_ids: Vec<i64> },
+    RemoveFromPlaylist { playlist_id: i64, track_id: i64 },
     ConnectPeer { target: String },
     DiscoverLan,
     SyncRefresh { message: Option<String> },
@@ -223,6 +224,10 @@ pub struct WebStateDto {
 }
 
 pub fn track_to_remote_dto(t: &rust_audio_core::Track) -> RemoteTrackDto {
+    let peer_node = match &t.source {
+        rust_audio_core::TrackSource::Peer { node_name, .. } => Some(node_name.clone()),
+        _ => None,
+    };
     RemoteTrackDto {
         id: t.id,
         title: t.title.clone(),
@@ -234,6 +239,7 @@ pub fn track_to_remote_dto(t: &rust_audio_core::Track) -> RemoteTrackDto {
         file_size_bytes: t.file_size_bytes,
         format: t.format.clone(),
         pinned: t.pinned,
+        peer_node,
     }
 }
 
@@ -296,9 +302,10 @@ impl PeerTicket {
         );
 
         let endpoint = normalize_endpoint(host_port_raw, DEFAULT_P2P_PORT)?;
+        validate_peer_endpoint(&endpoint)?;
 
         let mut auth_token = String::new();
-        let mut node_name = host_only(&endpoint).to_string();
+        let mut node_name = sanitize_display_text(host_only(&endpoint));
         let mut node_id = String::new();
 
         if let Some((delim, tail)) = rest {
@@ -322,13 +329,13 @@ impl PeerTicket {
                     };
                     match k {
                         "name" => {
-                            let decoded = percent_decode(v);
+                            let decoded = sanitize_display_text(&percent_decode(v));
                             if !decoded.trim().is_empty() {
                                 node_name = decoded;
                             }
                         }
                         "id" => {
-                            let decoded = percent_decode(v);
+                            let decoded = sanitize_display_text(&percent_decode(v));
                             if !decoded.trim().is_empty() {
                                 node_id = decoded;
                             }
@@ -462,6 +469,41 @@ fn normalize_endpoint(raw: &str, default_port: u16) -> Result<String> {
     } else {
         Ok(format!("{raw}:{default_port}"))
     }
+}
+
+pub fn validate_peer_endpoint(endpoint: &str) -> Result<()> {
+    const BLOCKED_INTERNAL_PORTS: &[u16] = &[22, 3306, 5432, 6379, 8080, 8191, 9117];
+    let (raw_host, port_str) = endpoint
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("Missing port in endpoint"))?;
+    let port: u16 = port_str.parse()?;
+    anyhow::ensure!(
+        port > 0 && !BLOCKED_INTERNAL_PORTS.contains(&port),
+        "Blocked internal service port {port}"
+    );
+    let host = raw_host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(raw_host);
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        anyhow::ensure!(!ip.is_unspecified(), "Unspecified peer IP not allowed");
+        match ip {
+            IpAddr::V4(v4) => {
+                anyhow::ensure!(
+                    !v4.is_link_local() && !v4.is_multicast(),
+                    "Link-local/metadata/multicast IP not allowed"
+                );
+            }
+            IpAddr::V6(v6) => {
+                let is_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+                anyhow::ensure!(
+                    !is_link_local && !v6.is_multicast(),
+                    "Link-local/multicast IPv6 not allowed"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn host_only(endpoint: &str) -> &str {

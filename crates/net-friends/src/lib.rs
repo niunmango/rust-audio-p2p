@@ -7,9 +7,10 @@ pub mod webui;
 
 pub use client::FriendNodeClient;
 pub use protocol::{
-    detect_lan_ip, track_to_remote_dto, verify_token_ct, NodeIdentity, NodeInfoDto, PeerTicket,
-    RemoteCatalogDto, RemotePlaylistDto, RemoteTrackDto, WebPeerSummary, WebPlayerSnapshot,
-    WebPlaylistSummary, WebRemoteCommand, WebStateDto, DEFAULT_P2P_PORT, LAN_DISCOVERY_PORT,
+    detect_lan_ip, sanitize_display_text, track_to_remote_dto, validate_peer_endpoint,
+    verify_token_ct, NodeIdentity, NodeInfoDto, PeerTicket, RemoteCatalogDto, RemotePlaylistDto,
+    RemoteTrackDto, WebPeerSummary, WebPlayerSnapshot, WebPlaylistSummary, WebRemoteCommand,
+    WebStateDto, DEFAULT_P2P_PORT, LAN_DISCOVERY_PORT,
 };
 pub use server::FriendNodeServer;
 
@@ -287,6 +288,331 @@ mod tests {
         assert_eq!(ev2, WebRemoteCommand::PlayTrack { track_id: tid });
 
         server.shutdown();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn test_security_ssrf_dns_rebinding_csrf_and_headers() {
+        // 1. SSRF port & link-local checks in PeerTicket::parse
+        assert!(PeerTicket::parse("127.0.0.1:9117").is_err());
+        assert!(PeerTicket::parse("127.0.0.1:8080").is_err());
+        assert!(PeerTicket::parse("169.254.169.254:80").is_err());
+        assert!(PeerTicket::parse("0.0.0.0:4261").is_err());
+        assert!(PeerTicket::parse("[fe80::1]:4261").is_err());
+
+        // 2. DNS rebinding (Host), cross-site Sec-Fetch-Site, and HTTP security headers
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let identity = NodeIdentity::load_or_create(&db.lock().unwrap()).unwrap();
+        let server = FriendNodeServer::start_with_options(
+            Arc::clone(&db),
+            identity.clone(),
+            Some(0),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let base = format!("http://127.0.0.1:{}", server.port);
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        // Security headers must be present on Web UI responses
+        let ok_res = http.get(&base).send().await.unwrap();
+        assert_eq!(ok_res.status().as_u16(), 200);
+        assert_eq!(
+            ok_res.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert!(ok_res.headers().contains_key("content-security-policy"));
+
+        // External Host header simulating DNS rebinding must return 403 Forbidden
+        let rebind_res = http
+            .get(format!("{base}/api/v1/lan-ticket"))
+            .header("Host", format!("evil.attacker.com:{}", server.port))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rebind_res.status().as_u16(), 403);
+
+        // Cross-site request on API must return 403 Forbidden
+        let csrf_res = http
+            .get(format!("{base}/api/v1/lan-ticket"))
+            .header("Sec-Fetch-Site", "cross-site")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(csrf_res.status().as_u16(), 403);
+
+        // Untrusted browser Origin must return 403 Forbidden
+        let origin_res = http
+            .get(format!("{base}/api/v1/lan-ticket"))
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(origin_res.status().as_u16(), 403);
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_webui_p2p_library_search_stream_and_playlist_management() {
+        let temp = std::env::temp_dir().join(format!(
+            "rust_audio_webui_p2p_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let audio_file = temp.join("remote_track.flac");
+        let payload = b"fLaC_remote_p2p_web_stream_payload_123456";
+        std::fs::write(&audio_file, payload).unwrap();
+
+        // Node A holds a local track
+        let db_a = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let mut id_a = NodeIdentity::load_or_create(&db_a.lock().unwrap()).unwrap();
+        id_a.node_name = "server-air".to_string();
+        let remote_tid = db_a
+            .lock()
+            .unwrap()
+            .upsert_track(&Track {
+                id: 0,
+                title: "Samba Remota".to_string(),
+                artist: "Spinetta".to_string(),
+                album: "Nodos".to_string(),
+                year: Some(1977),
+                track_number: Some(1),
+                duration_secs: Some(195),
+                file_size_bytes: payload.len() as u64,
+                format: "flac".to_string(),
+                cover_path: None,
+                source: TrackSource::LocalFile {
+                    path: audio_file.to_string_lossy().to_string(),
+                },
+                pinned: false,
+            })
+            .unwrap();
+        let server_a =
+            FriendNodeServer::start_with_options(Arc::clone(&db_a), id_a.clone(), Some(0), None)
+                .await
+                .unwrap();
+
+        // Node B pairs Node A with uncached TrackSource::Peer + has one local track
+        let db_b = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let id_b = NodeIdentity::load_or_create(&db_b.lock().unwrap()).unwrap();
+        let local_b_file = temp.join("local_b.flac");
+        std::fs::write(&local_b_file, b"fLaC_local_b").unwrap();
+        let (local_b_tid, peer_tid_on_b) = {
+            let guard = db_b.lock().unwrap();
+            guard
+                .save_paired_peers(&[rust_audio_core::PairedPeer {
+                    node_id: id_a.node_id.clone(),
+                    node_name: id_a.node_name.clone(),
+                    endpoint: format!("127.0.0.1:{}", server_a.port),
+                    auth_token: id_a.auth_token.clone(),
+                    track_count: 1,
+                    playlist_count: 0,
+                }])
+                .unwrap();
+            let t_local = guard
+                .upsert_track(&Track {
+                    id: 0,
+                    title: "Local Track B".to_string(),
+                    artist: "Local".to_string(),
+                    album: "Kubuntu".to_string(),
+                    year: Some(2025),
+                    track_number: Some(1),
+                    duration_secs: Some(100),
+                    file_size_bytes: 12,
+                    format: "flac".to_string(),
+                    cover_path: None,
+                    source: TrackSource::LocalFile {
+                        path: local_b_file.to_string_lossy().to_string(),
+                    },
+                    pinned: false,
+                })
+                .unwrap();
+            let t_peer = guard
+                .upsert_track(&Track {
+                    id: 0,
+                    title: "Samba Remota".to_string(),
+                    artist: "Spinetta".to_string(),
+                    album: "Nodos".to_string(),
+                    year: Some(1977),
+                    track_number: Some(1),
+                    duration_secs: Some(195),
+                    file_size_bytes: payload.len() as u64,
+                    format: "flac".to_string(),
+                    cover_path: None,
+                    source: TrackSource::Peer {
+                        node_id: id_a.node_id.clone(),
+                        node_name: id_a.node_name.clone(),
+                        remote_track_id: remote_tid,
+                        cached_path: None,
+                    },
+                    pinned: false,
+                })
+                .unwrap();
+            (t_local, t_peer)
+        };
+        let server_b =
+            FriendNodeServer::start_with_options(Arc::clone(&db_b), id_b.clone(), Some(0), None)
+                .await
+                .unwrap();
+
+        let base_b = format!("http://127.0.0.1:{}", server_b.port);
+        let http = reqwest::Client::new();
+
+        // 1. Catalog WITHOUT include_peer must NOT re-export Node A's peer track
+        let cat_no_peer: RemoteCatalogDto = http
+            .get(format!("{base_b}/api/v1/catalog"))
+            .header("X-Peer-Token", &id_b.auth_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cat_no_peer.tracks.len(), 1);
+        assert_eq!(cat_no_peer.tracks[0].id, local_b_tid);
+
+        // 2. Catalog WITH include_peer=1 (Web UI 1. Library) MUST include uncached P2P track + badge
+        let cat_with_peer: RemoteCatalogDto = http
+            .get(format!("{base_b}/api/v1/catalog?include_peer=1"))
+            .header("X-Peer-Token", &id_b.auth_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cat_with_peer.tracks.len(), 2);
+        let remote_dto = cat_with_peer
+            .tracks
+            .iter()
+            .find(|t| t.id == peer_tid_on_b)
+            .unwrap();
+        assert_eq!(remote_dto.peer_node.as_deref(), Some("server-air"));
+
+        // 3. /api/v1/search?q=Samba MUST find the uncached P2P track too
+        let search_hits: Vec<RemoteTrackDto> = http
+            .get(format!(
+                "{base_b}/api/v1/search?q=Samba&token={}",
+                id_b.auth_token
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(search_hits.len(), 1);
+        assert_eq!(search_hits[0].id, peer_tid_on_b);
+        assert_eq!(search_hits[0].peer_node.as_deref(), Some("server-air"));
+
+        // 4. /api/v1/stream/<peer_tid_on_b> transparently fetches from Node A & streams bytes
+        let stream_resp = http
+            .get(format!(
+                "{base_b}/api/v1/stream/{peer_tid_on_b}?token={}",
+                id_b.auth_token
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stream_resp.status().as_u16(), 200);
+        assert_eq!(stream_resp.bytes().await.unwrap().as_ref(), payload);
+
+        // Clean up cached file written during on-demand fetch
+        if let Ok(Some(updated)) = db_b.lock().unwrap().get_track(peer_tid_on_b) {
+            if let Some(p) = updated.source.playable_path() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+
+        // 5. Batch playlist creation, rename, remove track, delete playlist
+        let create_res = http
+            .post(format!("{base_b}/api/v1/control"))
+            .header("X-Peer-Token", &id_b.auth_token)
+            .json(&WebRemoteCommand::CreatePlaylistWithTracks {
+                name: "Mix Nodos".to_string(),
+                track_ids: vec![local_b_tid, peer_tid_on_b],
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_res.status().as_u16(), 200);
+
+        let st1: WebStateDto = http
+            .get(format!("{base_b}/api/v1/state"))
+            .header("X-Peer-Token", &id_b.auth_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(st1.playlists.len(), 1);
+        let pl_id = st1.playlists[0].id;
+        assert_eq!(st1.playlists[0].track_ids.len(), 2);
+
+        http.post(format!("{base_b}/api/v1/control"))
+            .header("X-Peer-Token", &id_b.auth_token)
+            .json(&WebRemoteCommand::RenamePlaylist {
+                playlist_id: pl_id,
+                new_name: "Mix Final".to_string(),
+            })
+            .send()
+            .await
+            .unwrap();
+
+        http.post(format!("{base_b}/api/v1/control"))
+            .header("X-Peer-Token", &id_b.auth_token)
+            .json(&WebRemoteCommand::RemoveFromPlaylist {
+                playlist_id: pl_id,
+                track_id: local_b_tid,
+            })
+            .send()
+            .await
+            .unwrap();
+
+        let st2: WebStateDto = http
+            .get(format!("{base_b}/api/v1/state"))
+            .header("X-Peer-Token", &id_b.auth_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(st2.playlists[0].name, "Mix Final");
+        assert_eq!(st2.playlists[0].track_ids, vec![peer_tid_on_b]);
+
+        http.post(format!("{base_b}/api/v1/control"))
+            .header("X-Peer-Token", &id_b.auth_token)
+            .json(&WebRemoteCommand::DeletePlaylist { playlist_id: pl_id })
+            .send()
+            .await
+            .unwrap();
+
+        let st3: WebStateDto = http
+            .get(format!("{base_b}/api/v1/state"))
+            .header("X-Peer-Token", &id_b.auth_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(st3.playlists.is_empty());
+
+        server_b.shutdown();
+        server_a.shutdown();
         let _ = std::fs::remove_dir_all(&temp);
     }
 }

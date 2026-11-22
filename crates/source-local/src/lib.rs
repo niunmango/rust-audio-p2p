@@ -33,9 +33,18 @@ pub fn is_supported_audio(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+pub fn is_regular_non_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.is_file() && !m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 pub fn should_descend(entry: &DirEntry) -> bool {
     if entry.depth() == 0 {
         return true;
+    }
+    if entry.file_type().is_symlink() {
+        return false;
     }
     if !entry.file_type().is_dir() {
         return true;
@@ -55,14 +64,14 @@ pub fn find_cover_image(audio_path: &Path) -> Option<String> {
     let dir = audio_path.parent()?;
     for candidate in COVER_FILENAMES {
         let p = dir.join(candidate);
-        if p.exists() {
+        if is_regular_non_symlink(&p) {
             return Some(p.to_string_lossy().to_string());
         }
     }
     if let Some(parent) = dir.parent() {
         for candidate in COVER_FILENAMES {
             let p = parent.join(candidate);
-            if p.exists() {
+            if is_regular_non_symlink(&p) {
                 return Some(p.to_string_lossy().to_string());
             }
         }
@@ -116,7 +125,12 @@ fn extract_album_and_year(raw: &str) -> (String, Option<i32>) {
 }
 
 pub fn extract_track_metadata(path: &Path) -> Result<Track> {
-    let meta = std::fs::metadata(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        meta.is_file() && !meta.file_type().is_symlink(),
+        "Refusing to index non-regular file or symlink"
+    );
+    anyhow::ensure!(is_supported_audio(path), "Unsupported audio extension");
     let size = meta.len();
     let format = path
         .extension()
@@ -331,7 +345,7 @@ pub fn start_watcher_for_dirs(
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res {
             for path in event.paths {
-                if path.is_file() && is_supported_audio(&path) {
+                if is_regular_non_symlink(&path) && is_supported_audio(&path) {
                     if let Ok(track) = extract_track_metadata(&path) {
                         if let Ok(guard) = db.lock() {
                             let _ = guard.upsert_track(&track);
@@ -429,6 +443,16 @@ mod tests {
         std::fs::write(music_dir.join("01 - Track One.flac"), b"not-a-real-flac").unwrap();
         std::fs::write(music_dir.join("cover.jpg"), b"jpg").unwrap();
         std::fs::write(hidden_dir.join("ignored.mp3"), b"ignored").unwrap();
+        #[cfg(unix)]
+        let secret_outside = {
+            let secret = std::env::temp_dir()
+                .join(format!("rust_audio_secret_outside_{}.flac", std::process::id()));
+            std::fs::write(&secret, b"secret").unwrap();
+            let _ = std::fs::remove_file(music_dir.join("02 - Symlinked.flac"));
+            std::os::unix::fs::symlink(&secret, music_dir.join("02 - Symlinked.flac"))
+                .unwrap();
+            secret
+        };
 
         let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
         let indexed = scan_directory_sync(&base, &db, None).unwrap();
@@ -442,6 +466,8 @@ mod tests {
         assert_eq!(tracks[0].year, Some(2022));
         assert!(tracks[0].cover_path.as_deref().unwrap().ends_with("cover.jpg"));
 
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&secret_outside);
         let _ = std::fs::remove_dir_all(&base);
     }
 

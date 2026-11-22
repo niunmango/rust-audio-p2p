@@ -19,6 +19,14 @@ const PUBLIC_TRACKERS: &[&str] = &[
     "udp://exodus.desync.com:6969/announce",
 ];
 
+pub fn is_safe_relative_torrent_path(path: &std::path::Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
 pub fn sanitize_torrent_uri(raw: &str) -> String {
     let trimmed = raw.trim().trim_matches(|c| c == '"' || c == '\'');
     let lower = trimmed.to_ascii_lowercase();
@@ -261,20 +269,29 @@ impl TorrentEngine {
                 meta.file_infos
                     .iter()
                     .enumerate()
-                    .map(|(idx, f)| {
+                    .filter(|(_, f)| is_safe_relative_torrent_path(&f.relative_filename))
+                    .filter_map(|(idx, f)| {
                         let direct = download_dir.join(&f.relative_filename);
-                        let nested = if sub.is_empty() {
-                            direct.clone()
-                        } else {
+                        let nested = if !sub.is_empty()
+                            && is_safe_relative_torrent_path(std::path::Path::new(sub))
+                        {
                             download_dir.join(sub).join(&f.relative_filename)
+                        } else {
+                            direct.clone()
                         };
                         let full_path = if direct.exists() { direct } else { nested };
-                        TorrentFileEntry {
+                        if std::fs::symlink_metadata(&full_path)
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false)
+                        {
+                            return None;
+                        }
+                        Some(TorrentFileEntry {
                             index: idx,
                             path: f.relative_filename.to_string_lossy().to_string(),
                             full_path,
                             length: f.len,
-                        }
+                        })
                     })
                     .collect::<Vec<_>>()
             })
@@ -325,5 +342,16 @@ mod tests {
 
         let short_url = "http://h/?apikey=SUPERSECRET";
         assert!(!extract_magnet_display_name(short_url).contains("SUPERSECRET"));
+    }
+
+    #[test]
+    fn test_is_safe_relative_torrent_path() {
+        use std::path::Path;
+        assert!(is_safe_relative_torrent_path(Path::new("01 - Song.flac")));
+        assert!(is_safe_relative_torrent_path(Path::new("CD1/01.flac")));
+        assert!(!is_safe_relative_torrent_path(Path::new("")));
+        assert!(!is_safe_relative_torrent_path(Path::new("/etc/passwd")));
+        assert!(!is_safe_relative_torrent_path(Path::new("../../etc/passwd")));
+        assert!(!is_safe_relative_torrent_path(Path::new("album/../../evil")));
     }
 }

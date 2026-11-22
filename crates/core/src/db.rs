@@ -331,6 +331,37 @@ impl Database {
         Ok(id)
     }
 
+    pub fn rename_playlist(&self, playlist_id: i64, new_name: &str) -> Result<()> {
+        let clean = new_name.trim();
+        anyhow::ensure!(!clean.is_empty(), "Playlist name cannot be empty");
+        self.conn.execute(
+            "UPDATE playlists SET name = ?1 WHERE id = ?2",
+            params![clean, playlist_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_playlist(&self, playlist_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
+            params![playlist_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM playlists WHERE id = ?1",
+            params![playlist_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_tracks_to_playlist(&self, playlist_id: i64, track_ids: &[i64]) -> Result<usize> {
+        let mut added = 0usize;
+        for &track_id in track_ids {
+            self.add_track_to_playlist(playlist_id, track_id)?;
+            added += 1;
+        }
+        Ok(added)
+    }
+
     pub fn list_playlists(&self) -> Result<Vec<Playlist>> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -767,5 +798,64 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_playlist_rename_delete_and_batch_add() {
+        let db = Database::open_in_memory().unwrap();
+        let id1 = db
+            .upsert_track(&Track {
+                id: 0,
+                title: "Tema Uno".into(),
+                artist: "Artista".into(),
+                album: "Album".into(),
+                year: Some(2020),
+                track_number: Some(1),
+                duration_secs: Some(180),
+                file_size_bytes: 1000,
+                format: "flac".into(),
+                cover_path: None,
+                source: TrackSource::LocalFile {
+                    path: "/tmp/t1.flac".into(),
+                },
+                pinned: false,
+            })
+            .unwrap();
+        let id2 = db
+            .upsert_track(&Track {
+                id: 0,
+                title: "Tema Dos".into(),
+                artist: "Artista".into(),
+                album: "Album".into(),
+                year: Some(2020),
+                track_number: Some(2),
+                duration_secs: Some(200),
+                file_size_bytes: 1000,
+                format: "flac".into(),
+                cover_path: None,
+                source: TrackSource::LocalFile {
+                    path: "/tmp/t2.flac".into(),
+                },
+                pinned: false,
+            })
+            .unwrap();
+
+        let pl_id = db.create_playlist("Borrador").unwrap();
+        let added = db.add_tracks_to_playlist(pl_id, &[id1, id2]).unwrap();
+        assert_eq!(added, 2);
+        assert_eq!(db.get_playlist_tracks(pl_id).unwrap().len(), 2);
+
+        db.rename_playlist(pl_id, "Favoritas Ruta").unwrap();
+        let pls = db.list_playlists().unwrap();
+        assert_eq!(pls.len(), 1);
+        assert_eq!(pls[0].name, "Favoritas Ruta");
+        assert_eq!(pls[0].track_count, 2);
+
+        db.remove_track_from_playlist(pl_id, id1).unwrap();
+        assert_eq!(db.get_playlist_tracks(pl_id).unwrap().len(), 1);
+
+        db.delete_playlist(pl_id).unwrap();
+        assert!(db.list_playlists().unwrap().is_empty());
+        assert!(db.get_playlist_tracks(pl_id).unwrap().is_empty());
     }
 }

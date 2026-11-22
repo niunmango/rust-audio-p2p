@@ -610,6 +610,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             app.open_playlist_picker_for_selected();
             return Ok(());
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
+            app.toggle_mark_selected_track();
+            return Ok(());
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
             app.toggle_pin_selected()?;
             return Ok(());
@@ -634,11 +638,21 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
-    // 3. New Playlist input editing
-    if app.playlist_editing && app.active_tab == Tab::Playlists {
+    // 3. New Playlist / Rename Playlist input editing
+    if (app.playlist_editing || app.playlist_renaming) && app.active_tab == Tab::Playlists {
         match key.code {
-            KeyCode::Esc => app.playlist_editing = false,
-            KeyCode::Enter => app.create_playlist_from_input()?,
+            KeyCode::Esc => {
+                app.playlist_editing = false;
+                app.playlist_renaming = false;
+                app.playlist_input.clear();
+            }
+            KeyCode::Enter => {
+                if app.playlist_renaming {
+                    app.confirm_rename_playlist()?;
+                } else {
+                    app.create_playlist_from_input()?;
+                }
+            }
             KeyCode::Backspace => {
                 app.playlist_input.pop();
             }
@@ -749,9 +763,18 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Char('b') => app.prev_track()?,
         KeyCode::Char('p') => app.toggle_pin_selected()?,
+        KeyCode::Char('x') => app.toggle_mark_selected_track(),
+        KeyCode::Char('X') => app.clear_marked_tracks(),
         KeyCode::Char('a') => app.open_playlist_picker_for_selected(),
+        KeyCode::Char('e') | KeyCode::F(2) if app.active_tab == Tab::Playlists => {
+            app.start_renaming_selected_playlist();
+        }
         KeyCode::Char('d') | KeyCode::Delete if app.active_tab == Tab::Playlists => {
-            app.remove_selected_from_playlist()?;
+            if app.playlist_focus == PlaylistPanelFocus::Playlists {
+                app.delete_selected_playlist()?;
+            } else {
+                app.remove_selected_from_playlist()?;
+            }
         }
         KeyCode::Char('d') if app.active_tab == Tab::Friends => app.trigger_lan_discovery(),
         KeyCode::Char('r') => app.trigger_rescan(),
@@ -1202,6 +1225,42 @@ mod tests {
         app.toggle_qr_modal();
         assert!(app.show_qr_modal);
         terminal.draw(|f| ui::draw(f, &app)).unwrap();
+
+        let _ = std::fs::remove_dir_all(&temp_base);
+    }
+
+    #[test]
+    fn test_tui_multi_mark_and_playlist_rename_delete() {
+        let (mut app, temp_base) = make_test_app();
+        // Mark both Alpha and Beta with 'x'
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)).unwrap();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.marked_track_ids.len(), 2);
+
+        // Press 'a' -> batch playlist picker -> create "Ruta"
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        assert!(app.playlist_picker.is_some());
+        if let Some(p) = &mut app.playlist_picker {
+            p.creating_new = true;
+            p.new_name = "Ruta".to_string();
+        }
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert!(app.marked_track_ids.is_empty());
+        assert_eq!(app.playlists.len(), 1);
+        assert_eq!(app.playlists[0].track_count, 2);
+
+        // Switch to Playlists tab, rename to "Viaje Largo", then delete
+        app.switch_tab(Tab::Playlists);
+        app.playlist_focus = PlaylistPanelFocus::Playlists;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)).unwrap();
+        assert!(app.playlist_renaming);
+        app.playlist_input = "Viaje Largo".to_string();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert!(!app.playlist_renaming);
+        assert_eq!(app.playlists[0].name, "Viaje Largo");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)).unwrap();
+        assert!(app.playlists.is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_base);
     }

@@ -9,8 +9,8 @@ use rust_audio_core::{
     PlaybackQueue, Playlist, ScanStatus, Track, TrackSource,
 };
 use rust_audio_net_friends::{
-    track_to_remote_dto, FriendNodeClient, FriendNodeServer, NodeIdentity, PeerTicket,
-    RemoteCatalogDto, WebPlayerSnapshot, WebRemoteCommand,
+    sanitize_display_text, track_to_remote_dto, FriendNodeClient, FriendNodeServer, NodeIdentity,
+    PeerTicket, RemoteCatalogDto, WebPlayerSnapshot, WebRemoteCommand,
 };
 use rust_audio_player::{AudioBackendKind, PlaybackState, PlayerEngine};
 use rust_audio_source_local::{
@@ -52,7 +52,7 @@ pub struct PeerDownloadIntent {
 }
 
 pub struct PlaylistPickerModal {
-    pub track: Track,
+    pub tracks: Vec<Track>,
     pub new_name: String,
 }
 
@@ -116,6 +116,9 @@ pub struct GuiState {
     pub selected_playlist_idx: Option<usize>,
     pub selected_playlist_tracks: Vec<Track>,
     pub new_playlist_input: String,
+    pub rename_playlist_id: Option<i64>,
+    pub rename_playlist_input: String,
+    pub marked_track_ids: HashSet<i64>,
     pub pinned_tracks: Vec<Track>,
     pub playlist_picker: Option<PlaylistPickerModal>,
     pub torrent_query: String,
@@ -282,6 +285,9 @@ impl GuiState {
             selected_playlist_idx: None,
             selected_playlist_tracks: Vec::new(),
             new_playlist_input: String::new(),
+            rename_playlist_id: None,
+            rename_playlist_input: String::new(),
+            marked_track_ids: HashSet::new(),
             pinned_tracks: Vec::new(),
             playlist_picker: None,
             torrent_query: String::new(),
@@ -462,8 +468,10 @@ impl GuiState {
                     }
                 }
                 AsyncEvent::P2pPeerSyncFailed { target, error } => {
-                    self.push_p2p_log(format!("[ERR] Connect '{target}': {error}"));
-                    self.status_message = format!("P2P err: {error}");
+                    let safe_target = sanitize_display_text(&redact_url_secrets(&target));
+                    let safe_err = sanitize_display_text(&redact_url_secrets(&error));
+                    self.push_p2p_log(format!("[ERR] Connect '{safe_target}': {safe_err}"));
+                    self.status_message = format!("P2P err: {safe_err}");
                 }
                 AsyncEvent::P2pTrackDownloaded {
                     source_key,
@@ -609,11 +617,18 @@ impl GuiState {
                     self.toggle_auto_next();
                 }
                 WebRemoteCommand::TogglePin { .. } => {}
-                WebRemoteCommand::CreatePlaylist { .. } | WebRemoteCommand::AddToPlaylist { .. } => {
+                WebRemoteCommand::CreatePlaylist { .. }
+                | WebRemoteCommand::CreatePlaylistWithTracks { .. }
+                | WebRemoteCommand::RenamePlaylist { .. }
+                | WebRemoteCommand::DeletePlaylist { .. }
+                | WebRemoteCommand::AddToPlaylist { .. }
+                | WebRemoteCommand::AddTracksToPlaylist { .. }
+                | WebRemoteCommand::RemoveFromPlaylist { .. } => {
                     need_refresh = true;
                 }
                 WebRemoteCommand::ConnectPeer { target } => {
-                    self.push_p2p_log(format!("[WEB] Connect '{target}'..."));
+                    let safe_target = sanitize_display_text(&redact_url_secrets(&target));
+                    self.push_p2p_log(format!("[WEB] Connect '{safe_target}'..."));
                     self.spawn_peer_sync(target);
                 }
                 WebRemoteCommand::DiscoverLan => {
@@ -775,27 +790,117 @@ impl GuiState {
         Ok(())
     }
 
-    pub fn add_track_to_playlist(&mut self, pl_id: i64, pl_name: &str, track: &Track) -> Result<()> {
+    pub fn open_batch_playlist_picker(&mut self) {
+        if self.marked_track_ids.is_empty() {
+            return;
+        }
+        let mut by_id = HashMap::new();
+        for list in [
+            &self.tracks,
+            &self.search_results,
+            &self.peer_tracks,
+            &self.selected_playlist_tracks,
+            &self.pinned_tracks,
+        ] {
+            for t in list {
+                if self.marked_track_ids.contains(&t.id) {
+                    by_id.entry(t.id).or_insert_with(|| t.clone());
+                }
+            }
+        }
+        if let Ok(guard) = self.db.lock() {
+            for &id in &self.marked_track_ids {
+                if !by_id.contains_key(&id) {
+                    if let Ok(Some(t)) = guard.get_track(id) {
+                        by_id.insert(id, t);
+                    }
+                }
+            }
+        }
+        let tracks: Vec<Track> = by_id.into_values().collect();
+        if !tracks.is_empty() {
+            self.playlist_picker = Some(PlaylistPickerModal {
+                tracks,
+                new_name: String::new(),
+            });
+        }
+    }
+
+    pub fn add_tracks_to_playlist(
+        &mut self,
+        pl_id: i64,
+        pl_name: &str,
+        tracks: &[Track],
+    ) -> Result<()> {
+        if tracks.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<i64> = tracks.iter().map(|t| t.id).collect();
         {
             let guard = self.db.lock().expect("db mutex poisoned");
-            guard.add_track_to_playlist(pl_id, track.id)?;
+            guard.add_tracks_to_playlist(pl_id, &ids)?;
         }
-        self.status_message = self.i18n.added_to_playlist(&track.title, pl_name);
+        self.status_message = if tracks.len() == 1 {
+            self.i18n.added_to_playlist(&tracks[0].title, pl_name)
+        } else {
+            self.i18n.added_multiple_to_playlist(tracks.len(), pl_name)
+        };
+        self.marked_track_ids.clear();
+        self.refresh_from_db()?;
+        Ok(())
+    }
+
+    pub fn create_playlist_and_add_tracks(&mut self, name: &str, tracks: &[Track]) -> Result<()> {
+        let clean = name.trim();
+        if clean.is_empty() || tracks.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<i64> = tracks.iter().map(|t| t.id).collect();
+        {
+            let guard = self.db.lock().expect("db mutex poisoned");
+            let pl_id = guard.create_playlist(clean)?;
+            guard.add_tracks_to_playlist(pl_id, &ids)?;
+        }
+        self.status_message = if tracks.len() == 1 {
+            self.i18n.added_to_playlist(&tracks[0].title, clean)
+        } else {
+            self.i18n.added_multiple_to_playlist(tracks.len(), clean)
+        };
+        self.marked_track_ids.clear();
         self.refresh_from_db()?;
         Ok(())
     }
 
     pub fn create_playlist_and_add_track(&mut self, name: &str, track: &Track) -> Result<()> {
-        let clean = name.trim();
+        self.create_playlist_and_add_tracks(name, std::slice::from_ref(track))
+    }
+
+    pub fn rename_playlist(&mut self, pl_id: i64, new_name: &str) -> Result<()> {
+        let clean = new_name.trim();
         if clean.is_empty() {
             return Ok(());
         }
         {
             let guard = self.db.lock().expect("db mutex poisoned");
-            let pl_id = guard.create_playlist(clean)?;
-            guard.add_track_to_playlist(pl_id, track.id)?;
+            guard.rename_playlist(pl_id, clean)?;
         }
-        self.status_message = self.i18n.added_to_playlist(&track.title, clean);
+        self.rename_playlist_id = None;
+        self.rename_playlist_input.clear();
+        self.status_message = self.i18n.playlist_renamed(clean);
+        self.refresh_from_db()?;
+        Ok(())
+    }
+
+    pub fn delete_playlist(&mut self, pl_id: i64, pl_name: &str) -> Result<()> {
+        {
+            let guard = self.db.lock().expect("db mutex poisoned");
+            guard.delete_playlist(pl_id)?;
+        }
+        if self.rename_playlist_id == Some(pl_id) {
+            self.rename_playlist_id = None;
+            self.rename_playlist_input.clear();
+        }
+        self.status_message = self.i18n.playlist_deleted(pl_name);
         self.refresh_from_db()?;
         Ok(())
     }
@@ -1044,8 +1149,9 @@ impl GuiState {
         if raw.is_empty() {
             return;
         }
-        self.push_p2p_log(format!("[INFO] Connecting to peer '{raw}'..."));
-        self.status_message = format!("⏳ P2P: {raw}...");
+        let safe_raw = sanitize_display_text(&redact_url_secrets(&raw));
+        self.push_p2p_log(format!("[INFO] Connecting to peer '{safe_raw}'..."));
+        self.status_message = format!("⏳ P2P: {safe_raw}...");
         self.spawn_peer_sync(raw);
     }
 
@@ -1079,9 +1185,10 @@ impl GuiState {
 
     pub fn apply_synced_peer(
         &mut self,
-        peer: PairedPeer,
+        mut peer: PairedPeer,
         catalog: RemoteCatalogDto,
     ) -> Result<()> {
+        peer.node_name = sanitize_display_text(&peer.node_name);
         if let Some(existing) = self
             .paired_peers
             .iter_mut()
@@ -1092,29 +1199,30 @@ impl GuiState {
             self.paired_peers.push(peer.clone());
         }
 
-        let track_count = catalog.tracks.len();
-        let playlist_count = catalog.playlists.len();
+        let clean_node_name = sanitize_display_text(&catalog.node_name);
+        let track_count = catalog.tracks.len().min(5000);
+        let playlist_count = catalog.playlists.len().min(100);
 
         {
             let guard = self.db.lock().expect("db mutex poisoned");
             guard.save_paired_peers(&self.paired_peers)?;
 
             let mut remote_to_local: HashMap<i64, i64> = HashMap::new();
-            for rt in &catalog.tracks {
+            for rt in catalog.tracks.iter().take(5000) {
                 let track = Track {
                     id: 0,
-                    title: rt.title.clone(),
-                    artist: rt.artist.clone(),
-                    album: rt.album.clone(),
+                    title: sanitize_display_text(&rt.title),
+                    artist: sanitize_display_text(&rt.artist),
+                    album: sanitize_display_text(&rt.album),
                     year: rt.year,
                     track_number: rt.track_number,
                     duration_secs: rt.duration_secs,
                     file_size_bytes: rt.file_size_bytes,
-                    format: rt.format.clone(),
+                    format: sanitize_display_text(&rt.format),
                     cover_path: None,
                     source: TrackSource::Peer {
                         node_id: catalog.node_id.clone(),
-                        node_name: catalog.node_name.clone(),
+                        node_name: clean_node_name.clone(),
                         remote_track_id: rt.id,
                         cached_path: None,
                     },
@@ -1125,8 +1233,9 @@ impl GuiState {
                 }
             }
 
-            for rpl in &catalog.playlists {
-                let pl_name = format!("[P2P: {}] {}", catalog.node_name, rpl.name);
+            for rpl in catalog.playlists.iter().take(100) {
+                let clean_pl = sanitize_display_text(&rpl.name);
+                let pl_name = format!("[P2P: {clean_node_name}] {clean_pl}");
                 if let Ok(local_pl_id) = guard.create_playlist(&pl_name) {
                     for remote_tid in &rpl.track_ids {
                         if let Some(&local_tid) = remote_to_local.get(remote_tid) {

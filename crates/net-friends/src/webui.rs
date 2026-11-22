@@ -58,6 +58,7 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
     button:hover { border-color: var(--accent); }
     button.active { background: var(--accent); color: #11111b; border-color: var(--accent); }
     button.green { border-color: var(--green); color: var(--green); }
+    button.danger { border-color: var(--red); color: var(--red); }
     nav.tabs {
       display: flex; gap: 6px; padding: 10px 14px; background: var(--bg);
       border-bottom: 1px solid var(--border); overflow-x: auto;
@@ -67,24 +68,31 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
       background: var(--surface); border: 1px solid var(--border);
       border-radius: 10px; padding: 12px; margin-bottom: 12px;
     }
+    .batch-bar {
+      background: #232338; border: 1px solid var(--accent);
+      border-radius: 10px; padding: 8px 12px; margin-bottom: 12px;
+      justify-content: space-between;
+    }
     .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     .grow { flex: 1; min-width: 180px; }
     .track-list { display: grid; gap: 6px; margin-top: 10px; }
     .track-item {
-      display: grid; grid-template-columns: 36px 1fr auto; gap: 10px; align-items: center;
+      display: grid; grid-template-columns: 24px 30px 1fr auto; gap: 8px; align-items: center;
       background: var(--card); border: 1px solid transparent; border-radius: 8px; padding: 8px 10px;
       cursor: pointer;
     }
+    .track-chk { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; margin: 0; }
     .track-item:hover { border-color: var(--border); }
     .track-item.playing { border-color: var(--accent); background: #232338; }
     .track-meta { min-width: 0; }
     .track-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .track-sub { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .track-actions { display: flex; gap: 6px; align-items: center; }
+    .track-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
     .badge {
       font-size: 11px; padding: 2px 6px; border-radius: 6px; background: #26263a; color: var(--muted);
       text-transform: uppercase;
     }
+    .badge.peer { color: var(--accent); border: 1px solid #3b5366; text-transform: none; }
     .pin-btn.pinned { color: var(--yellow); border-color: var(--yellow); }
     .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
     .player-bar {
@@ -130,6 +138,15 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
   </nav>
 
   <main>
+    <div id="batchBar" class="batch-bar row hidden">
+      <span id="batchCount" style="font-weight:700;color:var(--accent);"></span>
+      <div class="pill-row">
+        <button id="selectVisibleBtn"></button>
+        <button id="batchAddPlBtn" class="green"></button>
+        <button id="clearSelBtn"></button>
+      </div>
+    </div>
+
     <section id="view-library" class="view">
       <div class="panel row">
         <input id="libFilter" class="grow" type="search" />
@@ -159,7 +176,23 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
         <div class="panel">
           <div class="row" style="justify-content:space-between;margin-bottom:8px;">
             <span id="plTracksHeader" style="font-weight:700;"></span>
-            <button id="playPlBtn" class="green"></button>
+            <div class="pill-row">
+              <button id="playPlBtn" class="green"></button>
+              <button id="renamePlBtn"></button>
+              <button id="deletePlBtn" class="danger"></button>
+            </div>
+          </div>
+          <div id="renamePlBar" class="row hidden" style="margin-bottom:8px;">
+            <input id="renamePlInput" class="grow" type="text" />
+            <button id="saveRenamePlBtn" class="green"></button>
+            <button id="cancelRenamePlBtn"></button>
+          </div>
+          <div id="deletePlBar" class="row hidden" style="margin-bottom:8px;justify-content:space-between;">
+            <span id="deletePlMsg" style="color:var(--red);font-weight:600;"></span>
+            <div class="pill-row">
+              <button id="confirmDeletePlBtn" class="danger"></button>
+              <button id="cancelDeletePlBtn"></button>
+            </div>
           </div>
           <div id="plTrackList" class="track-list"></div>
         </div>
@@ -220,7 +253,12 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
   </dialog>
 
   <dialog id="plPickerDialog">
-    <h3 id="plPickerTitle" style="margin-top:0;"></h3>
+    <h3 id="plPickerTitle" style="margin-top:0;margin-bottom:4px;"></h3>
+    <div id="plPickerSub" class="muted" style="margin-bottom:8px;"></div>
+    <div class="row" style="margin-bottom:10px;">
+      <input id="plPickerNewName" class="grow" type="text" />
+      <button id="plPickerCreateBtn" class="green"></button>
+    </div>
     <div id="plPickerList" class="track-list"></div>
     <div class="row" style="margin-top:10px;justify-content:flex-end;">
       <button id="plPickerClose"></button>
@@ -239,14 +277,21 @@ const STR = {
     tabSearch: "2. Buscar (FTS5)",
     tabPl: "3. Playlists & Viaje",
     tabP2p: "4. Red P2P / Nodos",
-    filterPh: "Filtrar por título, artista o álbum...",
+    filterPh: "Filtrar por título, artista, álbum o nodo...",
     refresh: "↻ Actualizar",
-    ftsPh: "Buscar en biblioteca SQLite FTS5...",
+    ftsPh: "Buscar en biblioteca y nodos P2P conectados (FTS5)...",
     searchBtn: "Buscar",
     newPlPh: "Nueva playlist...",
     createPl: "+ Crear",
     playlists: "Playlists",
-    playPl: "▶ Reproducir lista",
+    playPl: "▶ Reproducir",
+    renamePl: "✎ Renombrar",
+    deletePl: "🗑 Borrar",
+    renamePlPh: "Nuevo nombre de playlist...",
+    saveName: "Guardar",
+    cancel: "Cancelar",
+    confirmDeletePl: "¿Borrar esta playlist?",
+    confirmDeleteYes: "Sí, borrar",
     p2pNode: "Token / URI de este nodo",
     copyTicket: "📋 Copiar Token",
     discover: "📡 Buscar en LAN",
@@ -257,7 +302,14 @@ const STR = {
     tokenTitle: "Autenticación del Nodo P2P",
     tokenHint: "El modo LAN público está desactivado o falta el token. Pegá el token del nodo:",
     save: "Conectar",
-    addPlTitle: "Agregar pista a Playlist",
+    addPlTitle: "Agregar a Playlist",
+    plPickerNewPh: "Crear nueva playlist y agregar...",
+    plPickerCreateBtn: "+ Crear y agregar",
+    selectedOne: "1 pista",
+    selectedMany: "{n} pistas seleccionadas",
+    selectVisible: "☑ Sel. visibles",
+    batchAddPl: "+ Agregar a Playlist",
+    clearSel: "✖ Limpiar",
     close: "Cerrar",
     autoOn: "Auto: ON",
     autoOff: "Auto: OFF",
@@ -271,14 +323,21 @@ const STR = {
     tabSearch: "2. Search (FTS5)",
     tabPl: "3. Playlists & Travel",
     tabP2p: "4. P2P Net / Nodes",
-    filterPh: "Filter by title, artist or album...",
+    filterPh: "Filter by title, artist, album, or node...",
     refresh: "↻ Refresh",
-    ftsPh: "Search SQLite FTS5 library...",
+    ftsPh: "Search library and connected P2P nodes (FTS5)...",
     searchBtn: "Search",
     newPlPh: "New playlist...",
     createPl: "+ Create",
     playlists: "Playlists",
     playPl: "▶ Play list",
+    renamePl: "✎ Rename",
+    deletePl: "🗑 Delete",
+    renamePlPh: "New playlist name...",
+    saveName: "Save",
+    cancel: "Cancel",
+    confirmDeletePl: "Delete this playlist?",
+    confirmDeleteYes: "Yes, delete",
     p2pNode: "Node Pairing Token / URI",
     copyTicket: "📋 Copy Token",
     discover: "📡 Scan LAN",
@@ -289,7 +348,14 @@ const STR = {
     tokenTitle: "P2P Node Authentication",
     tokenHint: "Open LAN sharing is disabled or token is missing. Paste node token:",
     save: "Connect",
-    addPlTitle: "Add track to Playlist",
+    addPlTitle: "Add to Playlist",
+    plPickerNewPh: "New playlist name...",
+    plPickerCreateBtn: "+ Create & add",
+    selectedOne: "1 track",
+    selectedMany: "{n} tracks selected",
+    selectVisible: "☑ Select visible",
+    batchAddPl: "+ Add to Playlist",
+    clearSel: "✖ Clear",
     close: "Close",
     autoOn: "Auto: ON",
     autoOff: "Auto: OFF",
@@ -304,15 +370,18 @@ const st = {
   tab: "library",
   tracks: [],
   trackMap: new Map(),
+  visibleLibTracks: [],
   searchTracks: [],
   playlists: [],
   selectedPlId: null,
+  selectedIds: new Set(),
   peers: [],
+  peerSig: "",
   queue: [],
   queueIdx: -1,
   autoNext: true,
   remotePlayer: null,
-  pendingPickerTrackId: null,
+  pendingPickerTrackIds: [],
   ticketUri: ""
 };
 
@@ -342,6 +411,17 @@ function applyLang() {
   document.getElementById("createPlBtn").textContent = t("createPl");
   document.getElementById("plHeader").textContent = t("playlists");
   document.getElementById("playPlBtn").textContent = t("playPl");
+  document.getElementById("renamePlBtn").textContent = t("renamePl");
+  document.getElementById("deletePlBtn").textContent = t("deletePl");
+  document.getElementById("renamePlInput").placeholder = t("renamePlPh");
+  document.getElementById("saveRenamePlBtn").textContent = t("saveName");
+  document.getElementById("cancelRenamePlBtn").textContent = t("cancel");
+  document.getElementById("deletePlMsg").textContent = t("confirmDeletePl");
+  document.getElementById("confirmDeletePlBtn").textContent = t("confirmDeleteYes");
+  document.getElementById("cancelDeletePlBtn").textContent = t("cancel");
+  document.getElementById("selectVisibleBtn").textContent = t("selectVisible");
+  document.getElementById("batchAddPlBtn").textContent = t("batchAddPl");
+  document.getElementById("clearSelBtn").textContent = t("clearSel");
   document.getElementById("p2pNodeTitle").textContent = t("p2pNode");
   document.getElementById("copyTicketBtn").textContent = t("copyTicket");
   document.getElementById("discoverBtn").textContent = t("discover");
@@ -352,9 +432,31 @@ function applyLang() {
   document.getElementById("tokenModalHint").textContent = t("tokenHint");
   document.getElementById("tokenModalSave").textContent = t("save");
   document.getElementById("plPickerTitle").textContent = t("addPlTitle");
+  document.getElementById("plPickerNewName").placeholder = t("plPickerNewPh");
+  document.getElementById("plPickerCreateBtn").textContent = t("plPickerCreateBtn");
   document.getElementById("plPickerClose").textContent = t("close");
   document.getElementById("modeBrowserBtn").classList.toggle("active", st.mode === "browser");
   document.getElementById("modeRemoteBtn").classList.toggle("active", st.mode === "remote");
+  updateBatchBar();
+}
+
+function updateBatchBar() {
+  const bar = document.getElementById("batchBar");
+  const n = st.selectedIds.size;
+  bar.classList.toggle("hidden", n === 0);
+  if (n > 0) {
+    document.getElementById("batchCount").textContent = t("selectedMany").replace("{n}", String(n));
+  }
+}
+
+function currentTabTracks() {
+  if (st.tab === "library") return st.visibleLibTracks;
+  if (st.tab === "search") return st.searchTracks;
+  if (st.tab === "playlists") {
+    const activePl = st.playlists.find(p => p.id === st.selectedPlId);
+    return activePl ? activePl.track_ids.map(id => st.trackMap.get(id)).filter(Boolean) : [];
+  }
+  return [];
 }
 
 function extractUrlToken() {
@@ -408,7 +510,7 @@ async function sendControl(payload) {
   setTimeout(loadState, 150);
 }
 
-function renderTrackList(containerId, list) {
+function renderTrackList(containerId, list, opts = {}) {
   const root = document.getElementById(containerId);
   root.replaceChildren();
   const activeId = activeCurrentTrack() ? activeCurrentTrack().id : null;
@@ -417,6 +519,17 @@ function renderTrackList(containerId, list) {
     const row = document.createElement("div");
     row.className = "track-item" + (activeId === tr.id ? " playing" : "");
     row.onclick = () => playListAt(list, i);
+
+    const chk = document.createElement("input");
+    chk.type = "checkbox";
+    chk.className = "track-chk";
+    chk.checked = st.selectedIds.has(tr.id);
+    chk.onclick = (ev) => {
+      ev.stopPropagation();
+      if (chk.checked) st.selectedIds.add(tr.id);
+      else st.selectedIds.delete(tr.id);
+      updateBatchBar();
+    };
 
     const num = document.createElement("span");
     num.className = "muted";
@@ -434,6 +547,12 @@ function renderTrackList(containerId, list) {
 
     const actions = document.createElement("div");
     actions.className = "track-actions";
+    if (tr.peer_node) {
+      const peerBadge = document.createElement("span");
+      peerBadge.className = "badge peer";
+      peerBadge.textContent = "🌐 " + tr.peer_node;
+      actions.appendChild(peerBadge);
+    }
     const badge = document.createElement("span");
     badge.className = "badge";
     badge.textContent = tr.format || "audio";
@@ -452,11 +571,25 @@ function renderTrackList(containerId, list) {
     addBtn.textContent = "+PL";
     addBtn.onclick = (ev) => {
       ev.stopPropagation();
-      openPlPicker(tr.id);
+      openPlPicker([tr.id]);
     };
 
     actions.append(badge, pinBtn, addBtn);
-    row.append(num, meta, actions);
+    if (opts.playlistId != null) {
+      const remBtn = document.createElement("button");
+      remBtn.className = "danger";
+      remBtn.textContent = "✕";
+      remBtn.onclick = async (ev) => {
+        ev.stopPropagation();
+        await sendControl({
+          action: "remove_from_playlist",
+          playlist_id: opts.playlistId,
+          track_id: tr.id
+        });
+      };
+      actions.appendChild(remBtn);
+    }
+    row.append(chk, num, meta, actions);
     root.appendChild(row);
   }
 }
@@ -464,14 +597,21 @@ function renderTrackList(containerId, list) {
 function renderPlaylists() {
   const plRoot = document.getElementById("plList");
   plRoot.replaceChildren();
-  if (!st.selectedPlId && st.playlists.length > 0) {
+  if ((!st.selectedPlId || !st.playlists.some(p => p.id === st.selectedPlId)) && st.playlists.length > 0) {
     st.selectedPlId = st.playlists[0].id;
+  } else if (st.playlists.length === 0) {
+    st.selectedPlId = null;
   }
   for (const pl of st.playlists) {
     const item = document.createElement("div");
     item.className = "track-item" + (pl.id === st.selectedPlId ? " playing" : "");
     item.style.gridTemplateColumns = "1fr auto";
-    item.onclick = () => { st.selectedPlId = pl.id; renderPlaylists(); };
+    item.onclick = () => {
+      st.selectedPlId = pl.id;
+      document.getElementById("renamePlBar").classList.add("hidden");
+      document.getElementById("deletePlBar").classList.add("hidden");
+      renderPlaylists();
+    };
     const nameEl = document.createElement("div");
     nameEl.className = "track-title";
     nameEl.textContent = (pl.pinned ? "★ " : "") + pl.name;
@@ -483,8 +623,11 @@ function renderPlaylists() {
   }
   const activePl = st.playlists.find(p => p.id === st.selectedPlId);
   document.getElementById("plTracksHeader").textContent = activePl ? activePl.name : "—";
+  document.getElementById("playPlBtn").disabled = !activePl;
+  document.getElementById("renamePlBtn").disabled = !activePl;
+  document.getElementById("deletePlBtn").disabled = !activePl;
   const tracks = activePl ? activePl.track_ids.map(id => st.trackMap.get(id)).filter(Boolean) : [];
-  renderTrackList("plTrackList", tracks);
+  renderTrackList("plTrackList", tracks, { playlistId: activePl ? activePl.id : null });
 }
 
 function renderPeers() {
@@ -518,15 +661,31 @@ function renderPeers() {
   }
 }
 
-function openPlPicker(trackId) {
-  st.pendingPickerTrackId = trackId;
+function openPlPicker(trackIds) {
+  const ids = Array.isArray(trackIds) ? trackIds : [trackIds];
+  if (ids.length === 0) return;
+  st.pendingPickerTrackIds = ids;
+  const subEl = document.getElementById("plPickerSub");
+  if (ids.length === 1) {
+    const tr = st.trackMap.get(ids[0]);
+    subEl.textContent = tr ? (tr.title + " — " + tr.artist) : t("selectedOne");
+  } else {
+    subEl.textContent = t("selectedMany").replace("{n}", String(ids.length));
+  }
+  document.getElementById("plPickerNewName").value = "";
   const listEl = document.getElementById("plPickerList");
   listEl.replaceChildren();
   for (const pl of st.playlists) {
     const btn = document.createElement("button");
     btn.textContent = pl.name + " (" + pl.track_ids.length + ")";
     btn.onclick = async () => {
-      await sendControl({ action: "add_to_playlist", playlist_id: pl.id, track_id: trackId });
+      if (ids.length === 1) {
+        await sendControl({ action: "add_to_playlist", playlist_id: pl.id, track_id: ids[0] });
+      } else {
+        await sendControl({ action: "add_tracks_to_playlist", playlist_id: pl.id, track_ids: ids });
+        st.selectedIds.clear();
+        updateBatchBar();
+      }
       document.getElementById("plPickerDialog").close();
     };
     listEl.appendChild(btn);
@@ -630,15 +789,40 @@ async function playPrev() {
   }
 }
 
+let libSearchTimer = null;
+
 function refreshFilteredLibrary() {
   const q = document.getElementById("libFilter").value.trim().toLowerCase();
   const filtered = q
     ? st.tracks.filter(tr =>
         (tr.title || "").toLowerCase().includes(q) ||
         (tr.artist || "").toLowerCase().includes(q) ||
-        (tr.album || "").toLowerCase().includes(q))
+        (tr.album || "").toLowerCase().includes(q) ||
+        (tr.format || "").toLowerCase().includes(q) ||
+        (tr.peer_node || "").toLowerCase().includes(q))
     : st.tracks;
+  st.visibleLibTracks = filtered;
   renderTrackList("libList", filtered);
+
+  if (q.length >= 2) {
+    clearTimeout(libSearchTimer);
+    libSearchTimer = setTimeout(async () => {
+      try {
+        const remoteHits = await apiFetch("/api/v1/search?q=" + encodeURIComponent(q));
+        if (Array.isArray(remoteHits) && remoteHits.length > 0) {
+          let changed = false;
+          for (const h of remoteHits) {
+            if (!st.trackMap.has(h.id)) {
+              st.tracks.push(h);
+              st.trackMap.set(h.id, h);
+              changed = true;
+            }
+          }
+          if (changed) refreshFilteredLibrary();
+        }
+      } catch (_) {}
+    }, 180);
+  }
 }
 
 async function loadCatalog() {
@@ -656,6 +840,11 @@ async function loadState() {
     st.ticketUri = s.ticket_uri;
     st.playlists = s.playlists || [];
     st.peers = s.peers || [];
+    const nextPeerSig = JSON.stringify(st.peers);
+    if (st.peerSig && st.peerSig !== nextPeerSig) {
+      loadCatalog().catch(() => {});
+    }
+    st.peerSig = nextPeerSig;
     st.remotePlayer = s.player || null;
     renderPlaylists();
     renderPeers();
@@ -714,6 +903,70 @@ document.getElementById("playPlBtn").onclick = () => {
   if (!pl) return;
   const tracks = pl.track_ids.map(id => st.trackMap.get(id)).filter(Boolean);
   playListAt(tracks, 0);
+};
+document.getElementById("renamePlBtn").onclick = () => {
+  const pl = st.playlists.find(p => p.id === st.selectedPlId);
+  if (!pl) return;
+  document.getElementById("deletePlBar").classList.add("hidden");
+  document.getElementById("renamePlInput").value = pl.name;
+  document.getElementById("renamePlBar").classList.remove("hidden");
+  document.getElementById("renamePlInput").focus();
+};
+document.getElementById("saveRenamePlBtn").onclick = async () => {
+  const pl = st.playlists.find(p => p.id === st.selectedPlId);
+  const newName = document.getElementById("renamePlInput").value.trim();
+  if (!pl || !newName) return;
+  document.getElementById("renamePlBar").classList.add("hidden");
+  await sendControl({ action: "rename_playlist", playlist_id: pl.id, new_name: newName });
+};
+document.getElementById("cancelRenamePlBtn").onclick = () => {
+  document.getElementById("renamePlBar").classList.add("hidden");
+};
+document.getElementById("deletePlBtn").onclick = () => {
+  const pl = st.playlists.find(p => p.id === st.selectedPlId);
+  if (!pl) return;
+  document.getElementById("renamePlBar").classList.add("hidden");
+  document.getElementById("deletePlBar").classList.remove("hidden");
+};
+document.getElementById("confirmDeletePlBtn").onclick = async () => {
+  const pl = st.playlists.find(p => p.id === st.selectedPlId);
+  document.getElementById("deletePlBar").classList.add("hidden");
+  if (!pl) return;
+  st.selectedPlId = null;
+  await sendControl({ action: "delete_playlist", playlist_id: pl.id });
+};
+document.getElementById("cancelDeletePlBtn").onclick = () => {
+  document.getElementById("deletePlBar").classList.add("hidden");
+};
+document.getElementById("selectVisibleBtn").onclick = () => {
+  for (const tr of currentTabTracks()) st.selectedIds.add(tr.id);
+  updateBatchBar();
+  refreshFilteredLibrary();
+  if (st.searchTracks.length) renderTrackList("searchList", st.searchTracks);
+  renderPlaylists();
+};
+document.getElementById("batchAddPlBtn").onclick = () => {
+  if (st.selectedIds.size > 0) openPlPicker(Array.from(st.selectedIds));
+};
+document.getElementById("clearSelBtn").onclick = () => {
+  st.selectedIds.clear();
+  updateBatchBar();
+  refreshFilteredLibrary();
+  if (st.searchTracks.length) renderTrackList("searchList", st.searchTracks);
+  renderPlaylists();
+};
+document.getElementById("plPickerCreateBtn").onclick = async () => {
+  const name = document.getElementById("plPickerNewName").value.trim();
+  const ids = st.pendingPickerTrackIds || [];
+  if (!name || ids.length === 0) return;
+  if (ids.length === 1) {
+    await sendControl({ action: "create_playlist", name, track_id: ids[0] });
+  } else {
+    await sendControl({ action: "create_playlist_with_tracks", name, track_ids: ids });
+    st.selectedIds.clear();
+    updateBatchBar();
+  }
+  document.getElementById("plPickerDialog").close();
 };
 document.getElementById("plPickerClose").onclick = () => document.getElementById("plPickerDialog").close();
 

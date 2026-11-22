@@ -318,6 +318,22 @@ mod tests {
             }
         }
 
+        // Exercise multi-select batch add + rename + delete in GUI state
+        let t_id = state.tracks[0].id;
+        state.marked_track_ids.insert(t_id);
+        state.open_batch_playlist_picker();
+        let picked = state.playlist_picker.take().unwrap();
+        state
+            .create_playlist_and_add_tracks("GUI Batch", &picked.tracks)
+            .unwrap();
+        assert!(state.marked_track_ids.is_empty());
+        assert_eq!(state.playlists.len(), 1);
+        let pl_id = state.playlists[0].id;
+        state.rename_playlist(pl_id, "GUI Renamed").unwrap();
+        assert_eq!(state.playlists[0].name, "GUI Renamed");
+        state.delete_playlist(pl_id, "GUI Renamed").unwrap();
+        assert!(state.playlists.is_empty());
+
         let _ = std::fs::remove_dir_all(&temp_base);
     }
 }

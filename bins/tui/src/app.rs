@@ -11,8 +11,8 @@ use rust_audio_core::{
     PlaybackQueue, Playlist, ScanStatus, Track, TrackSource,
 };
 use rust_audio_net_friends::{
-    track_to_remote_dto, FriendNodeClient, FriendNodeServer, NodeIdentity, PeerTicket,
-    RemoteCatalogDto, WebPlayerSnapshot, WebRemoteCommand,
+    sanitize_display_text, track_to_remote_dto, FriendNodeClient, FriendNodeServer, NodeIdentity,
+    PeerTicket, RemoteCatalogDto, WebPlayerSnapshot, WebRemoteCommand,
 };
 use rust_audio_player::{AudioBackendKind, PlaybackState, PlayerEngine};
 use rust_audio_source_local::{extract_track_metadata, is_supported_audio, spawn_home_scan, RecommendedWatcher};
@@ -67,7 +67,7 @@ pub enum PlaylistPanelFocus {
 
 #[derive(Debug, Clone)]
 pub struct PlaylistPickerState {
-    pub track: Track,
+    pub tracks: Vec<Track>,
     pub selected: usize, // 0..playlists.len()-1 are playlists; playlists.len() is "+ Create new"
     pub creating_new: bool,
     pub new_name: String,
@@ -172,6 +172,8 @@ pub struct App {
     pub pinned_tracks: Vec<Track>,
     pub playlist_input: String,
     pub playlist_editing: bool,
+    pub playlist_renaming: bool,
+    pub marked_track_ids: HashSet<i64>,
     pub playlist_picker: Option<PlaylistPickerState>,
     pub torrent_query: String,
     pub torrent_magnet_input: String,
@@ -354,6 +356,8 @@ impl App {
             pinned_tracks: Vec::new(),
             playlist_input: String::new(),
             playlist_editing: false,
+            playlist_renaming: false,
+            marked_track_ids: HashSet::new(),
             playlist_picker: None,
             torrent_query: String::new(),
             torrent_magnet_input: String::new(),
@@ -574,8 +578,12 @@ impl App {
                     }
                 }
                 AsyncEvent::P2pPeerSyncFailed { target, error } => {
-                    self.push_p2p_log(format!("[ERR] No se pudo conectar a '{target}': {error}"));
-                    self.status_message = format!("P2P err: {error}");
+                    let safe_target = sanitize_display_text(&redact_url_secrets(&target));
+                    let safe_err = sanitize_display_text(&redact_url_secrets(&error));
+                    self.push_p2p_log(format!(
+                        "[ERR] No se pudo conectar a '{safe_target}': {safe_err}"
+                    ));
+                    self.status_message = format!("P2P err: {safe_err}");
                 }
                 AsyncEvent::P2pTrackDownloaded {
                     source_key,
@@ -729,11 +737,18 @@ impl App {
                     self.toggle_auto_next();
                 }
                 WebRemoteCommand::TogglePin { .. } => {}
-                WebRemoteCommand::CreatePlaylist { .. } | WebRemoteCommand::AddToPlaylist { .. } => {
+                WebRemoteCommand::CreatePlaylist { .. }
+                | WebRemoteCommand::CreatePlaylistWithTracks { .. }
+                | WebRemoteCommand::RenamePlaylist { .. }
+                | WebRemoteCommand::DeletePlaylist { .. }
+                | WebRemoteCommand::AddToPlaylist { .. }
+                | WebRemoteCommand::AddTracksToPlaylist { .. }
+                | WebRemoteCommand::RemoveFromPlaylist { .. } => {
                     need_refresh = true;
                 }
                 WebRemoteCommand::ConnectPeer { target } => {
-                    self.push_p2p_log(format!("[WEB] Conectando a nodo '{target}'..."));
+                    let safe_target = sanitize_display_text(&redact_url_secrets(&target));
+                    self.push_p2p_log(format!("[WEB] Conectando a nodo '{safe_target}'..."));
                     self.spawn_peer_sync(target);
                 }
                 WebRemoteCommand::DiscoverLan => {
@@ -918,8 +933,74 @@ impl App {
         Ok(())
     }
 
+    pub fn toggle_mark_selected_track(&mut self) {
+        if let Some(tr) = self.selected_track_in_active_tab() {
+            if !self.marked_track_ids.remove(&tr.id) {
+                self.marked_track_ids.insert(tr.id);
+                // Advance cursor for rapid sequential selection
+                match self.active_tab {
+                    Tab::Library if self.library_selected + 1 < self.tracks.len() => {
+                        self.library_selected += 1;
+                    }
+                    Tab::Search if self.search_selected + 1 < self.search_results.len() => {
+                        self.search_selected += 1;
+                    }
+                    Tab::Friends if self.peer_track_selected + 1 < self.peer_tracks.len() => {
+                        self.peer_track_selected += 1;
+                    }
+                    Tab::Playlists
+                        if self.playlist_focus == PlaylistPanelFocus::PlaylistTracks
+                            && self.playlist_track_selected + 1
+                                < self.selected_playlist_tracks.len() =>
+                    {
+                        self.playlist_track_selected += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    pub fn clear_marked_tracks(&mut self) {
+        self.marked_track_ids.clear();
+    }
+
+    fn collect_marked_tracks_or_selected(&self) -> Vec<Track> {
+        if !self.marked_track_ids.is_empty() {
+            let mut by_id = std::collections::HashMap::new();
+            for list in [
+                &self.tracks,
+                &self.search_results,
+                &self.peer_tracks,
+                &self.selected_playlist_tracks,
+                &self.pinned_tracks,
+            ] {
+                for t in list {
+                    if self.marked_track_ids.contains(&t.id) {
+                        by_id.entry(t.id).or_insert_with(|| t.clone());
+                    }
+                }
+            }
+            if let Ok(guard) = self.db.lock() {
+                for &id in &self.marked_track_ids {
+                    if !by_id.contains_key(&id) {
+                        if let Ok(Some(t)) = guard.get_track(id) {
+                            by_id.insert(id, t);
+                        }
+                    }
+                }
+            }
+            let out: Vec<Track> = by_id.into_values().collect();
+            if !out.is_empty() {
+                return out;
+            }
+        }
+        self.selected_track_in_active_tab().into_iter().collect()
+    }
+
     pub fn open_playlist_picker_for_selected(&mut self) {
-        if let Some(track) = self.selected_track_in_active_tab() {
+        let tracks = self.collect_marked_tracks_or_selected();
+        if !tracks.is_empty() {
             let selected = if self.playlists.is_empty() {
                 0
             } else {
@@ -927,7 +1008,7 @@ impl App {
             };
             let creating_new = self.playlists.is_empty();
             self.playlist_picker = Some(PlaylistPickerState {
-                track,
+                tracks,
                 selected,
                 creating_new,
                 new_name: String::new(),
@@ -939,6 +1020,7 @@ impl App {
         let Some(picker) = self.playlist_picker.take() else {
             return Ok(());
         };
+        let track_ids: Vec<i64> = picker.tracks.iter().map(|t| t.id).collect();
         if picker.creating_new || picker.selected >= self.playlists.len() {
             let name = picker.new_name.trim();
             if name.is_empty() {
@@ -951,16 +1033,29 @@ impl App {
             {
                 let guard = self.db.lock().expect("db mutex poisoned");
                 let pl_id = guard.create_playlist(name)?;
-                guard.add_track_to_playlist(pl_id, picker.track.id)?;
+                guard.add_tracks_to_playlist(pl_id, &track_ids)?;
             }
-            self.status_message = self.i18n.added_to_playlist(&picker.track.title, name);
+            self.status_message = if picker.tracks.len() == 1 {
+                self.i18n.added_to_playlist(&picker.tracks[0].title, name)
+            } else {
+                self.i18n
+                    .added_multiple_to_playlist(picker.tracks.len(), name)
+            };
+            self.marked_track_ids.clear();
             self.refresh_from_db()?;
         } else if let Some(pl) = self.playlists.get(picker.selected).cloned() {
             {
                 let guard = self.db.lock().expect("db mutex poisoned");
-                guard.add_track_to_playlist(pl.id, picker.track.id)?;
+                guard.add_tracks_to_playlist(pl.id, &track_ids)?;
             }
-            self.status_message = self.i18n.added_to_playlist(&picker.track.title, &pl.name);
+            self.status_message = if picker.tracks.len() == 1 {
+                self.i18n
+                    .added_to_playlist(&picker.tracks[0].title, &pl.name)
+            } else {
+                self.i18n
+                    .added_multiple_to_playlist(picker.tracks.len(), &pl.name)
+            };
+            self.marked_track_ids.clear();
             self.refresh_from_db()?;
         }
         Ok(())
@@ -985,6 +1080,53 @@ impl App {
             guard.remove_track_from_playlist(pl.id, tr.id)?;
         }
         self.status_message = self.i18n.removed_from_playlist(&tr.title, &pl.name);
+        self.refresh_from_db()?;
+        Ok(())
+    }
+
+    pub fn start_renaming_selected_playlist(&mut self) {
+        if self.active_tab != Tab::Playlists {
+            return;
+        }
+        if let Some(pl) = self.playlists.get(self.playlist_selected) {
+            self.playlist_editing = false;
+            self.playlist_renaming = true;
+            self.playlist_input = pl.name.clone();
+        }
+    }
+
+    pub fn confirm_rename_playlist(&mut self) -> Result<()> {
+        let name = self.playlist_input.trim().to_string();
+        if !name.is_empty() {
+            if let Some(pl) = self.playlists.get(self.playlist_selected).cloned() {
+                {
+                    let guard = self.db.lock().expect("db mutex poisoned");
+                    guard.rename_playlist(pl.id, &name)?;
+                }
+                self.status_message = self.i18n.playlist_renamed(&name);
+                self.playlist_input.clear();
+                self.refresh_from_db()?;
+            }
+        }
+        self.playlist_renaming = false;
+        Ok(())
+    }
+
+    pub fn delete_selected_playlist(&mut self) -> Result<()> {
+        if self.active_tab != Tab::Playlists {
+            return Ok(());
+        }
+        let Some(pl) = self.playlists.get(self.playlist_selected).cloned() else {
+            return Ok(());
+        };
+        {
+            let guard = self.db.lock().expect("db mutex poisoned");
+            guard.delete_playlist(pl.id)?;
+        }
+        if self.playlist_selected > 0 && self.playlist_selected + 1 >= self.playlists.len() {
+            self.playlist_selected = self.playlist_selected.saturating_sub(1);
+        }
+        self.status_message = self.i18n.playlist_deleted(&pl.name);
         self.refresh_from_db()?;
         Ok(())
     }
@@ -1247,8 +1389,9 @@ impl App {
         if raw.is_empty() {
             return;
         }
-        self.push_p2p_log(format!("[INFO] Conectando a nodo '{}'...", raw));
-        self.status_message = format!("⏳ P2P: {raw}...");
+        let safe_raw = sanitize_display_text(&redact_url_secrets(&raw));
+        self.push_p2p_log(format!("[INFO] Conectando a nodo '{safe_raw}'..."));
+        self.status_message = format!("⏳ P2P: {safe_raw}...");
         self.spawn_peer_sync(raw);
     }
 
@@ -1295,9 +1438,10 @@ impl App {
 
     pub fn apply_synced_peer(
         &mut self,
-        peer: PairedPeer,
+        mut peer: PairedPeer,
         catalog: RemoteCatalogDto,
     ) -> Result<()> {
+        peer.node_name = sanitize_display_text(&peer.node_name);
         if let Some(existing) = self
             .paired_peers
             .iter_mut()
@@ -1308,29 +1452,30 @@ impl App {
             self.paired_peers.push(peer.clone());
         }
 
-        let track_count = catalog.tracks.len();
-        let playlist_count = catalog.playlists.len();
+        let clean_node_name = sanitize_display_text(&catalog.node_name);
+        let track_count = catalog.tracks.len().min(5000);
+        let playlist_count = catalog.playlists.len().min(100);
 
         {
             let guard = self.db.lock().expect("db mutex poisoned");
             guard.save_paired_peers(&self.paired_peers)?;
 
             let mut remote_to_local: HashMap<i64, i64> = HashMap::new();
-            for rt in &catalog.tracks {
+            for rt in catalog.tracks.iter().take(5000) {
                 let track = Track {
                     id: 0,
-                    title: rt.title.clone(),
-                    artist: rt.artist.clone(),
-                    album: rt.album.clone(),
+                    title: sanitize_display_text(&rt.title),
+                    artist: sanitize_display_text(&rt.artist),
+                    album: sanitize_display_text(&rt.album),
                     year: rt.year,
                     track_number: rt.track_number,
                     duration_secs: rt.duration_secs,
                     file_size_bytes: rt.file_size_bytes,
-                    format: rt.format.clone(),
+                    format: sanitize_display_text(&rt.format),
                     cover_path: None,
                     source: TrackSource::Peer {
                         node_id: catalog.node_id.clone(),
-                        node_name: catalog.node_name.clone(),
+                        node_name: clean_node_name.clone(),
                         remote_track_id: rt.id,
                         cached_path: None,
                     },
@@ -1341,8 +1486,9 @@ impl App {
                 }
             }
 
-            for rpl in &catalog.playlists {
-                let pl_name = format!("[P2P: {}] {}", catalog.node_name, rpl.name);
+            for rpl in catalog.playlists.iter().take(100) {
+                let clean_pl = sanitize_display_text(&rpl.name);
+                let pl_name = format!("[P2P: {clean_node_name}] {clean_pl}");
                 if let Ok(local_pl_id) = guard.create_playlist(&pl_name) {
                     for remote_tid in &rpl.track_ids {
                         if let Some(&local_tid) = remote_to_local.get(remote_tid) {

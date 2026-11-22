@@ -271,8 +271,8 @@ impl I18n {
 
     pub fn playlists_guide(&self) -> &'static str {
         self.t(
-            "Guía: [n] o clic en caja = Crear playlist | En Biblioteca(1)/Buscar(2) apretá [a] sobre un tema para agregarlo | [Tab] Cambiar panel | [Enter] Reproducir | [d] Quitar tema | [p] Pin Viaje",
-            "Guide: [n] or click box = New playlist | In Library(1)/Search(2) press [a] on a track to add it | [Tab] Switch panel | [Enter] Play | [d] Remove track | [p] Travel Pin",
+            "Guía: [n] Nueva | [e/F2] Renombrar | [d] Borrar lista o quitar tema | En Biblioteca(1)/Buscar(2) apretá [x] p/ marcar varias y [a] +Playlist | [Tab] Panel | [p] Pin Viaje",
+            "Guide: [n] New | [e/F2] Rename | [d] Delete playlist or remove track | In Library(1)/Search(2) press [x] to multi-select & [a] +Playlist | [Tab] Panel | [p] Travel Pin",
         )
     }
 
@@ -419,8 +419,8 @@ impl I18n {
 
     pub fn help_footer(&self) -> &'static str {
         self.t(
-            "1-6/Clic: Pestañas | Enter/DblClic: Reproducir | Space: Pausa | ←/→: Seek ±10s | +/-: Vol | n/b: Sig/Ant | A: Auto-Sig | a: +Playlist | p: Pin | r: Re-escanear | /: Buscar | l: Idioma | q: Salir",
-            "1-6/Click: Tabs | Enter/DblClick: Play | Space: Pause | ←/→: Seek ±10s | +/-: Vol | n/b: Next/Prev | A: Auto-Next | a: +Playlist | p: Pin | r: Rescan | /: Search | l: Lang | q: Quit",
+            "1-6: Pestañas | Enter: Reprod | Space: Pausa | ←/→: Seek | +/-: Vol | n/b: Sig/Ant | A: Auto-Sig | x/X: Marcar/Limpiar | a: +Playlist | p: Pin | /: Buscar | q: Salir",
+            "1-6: Tabs | Enter: Play | Space: Pause | ←/→: Seek | +/-: Vol | n/b: Next/Prev | A: Auto-Next | x/X: Mark/Clear | a: +Playlist | p: Pin | /: Search | q: Quit",
         )
     }
 
@@ -431,10 +431,38 @@ impl I18n {
         }
     }
 
+    pub fn playlist_renamed(&self, name: &str) -> String {
+        match self.lang {
+            Language::Es => format!("Playlist renombrada a: {name}"),
+            Language::En => format!("Playlist renamed to: {name}"),
+        }
+    }
+
+    pub fn playlist_deleted(&self, name: &str) -> String {
+        match self.lang {
+            Language::Es => format!("Playlist eliminada: {name}"),
+            Language::En => format!("Playlist deleted: {name}"),
+        }
+    }
+
     pub fn added_to_playlist(&self, title: &str, playlist: &str) -> String {
         match self.lang {
             Language::Es => format!("Agregada '{title}' a '{playlist}'"),
             Language::En => format!("Added '{title}' to '{playlist}'"),
+        }
+    }
+
+    pub fn added_multiple_to_playlist(&self, count: usize, playlist: &str) -> String {
+        match self.lang {
+            Language::Es => format!("Agregadas {count} pistas a '{playlist}'"),
+            Language::En => format!("Added {count} tracks to '{playlist}'"),
+        }
+    }
+
+    pub fn marked_tracks_badge(&self, count: usize) -> String {
+        match self.lang {
+            Language::Es => format!("[{count} seleccionadas · 'a' +Playlist · 'X' limpiar]"),
+            Language::En => format!("[{count} selected · 'a' +Playlist · 'X' clear]"),
         }
     }
 
