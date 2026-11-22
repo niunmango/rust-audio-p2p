@@ -1,0 +1,11 @@
+[package]
+name = "rust-audio-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rust-audio-core = { path = "../../crates/core" }
+rust-audio-source-local = { path = "../../crates/source-local" }
+rust-audio-source-torrent = { path = "../../crates/source-torrent" }
+rust-audio-player = { path = "../../crates/player" }

@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/source-local",
+    "crates/source-torrent",
+    "crates/net-friends",
+    "crates/player",
+    "bins/tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/niunmango/rust-audio-p2p"
+authors = ["niunmango"]
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
