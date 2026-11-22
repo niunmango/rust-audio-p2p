@@ -51,5 +51,17 @@ cargo build --release -p rust-audio-tui
 ./scripts/package-linux.sh
 ```
 
+---
+
+## Seguridad y privacidad / Security & privacy
+
+- **Variables de entorno / Environment variables**:
+  - `JACKETT_URL`: URL base de Jackett (por defecto `http://localhost:9117`). Como Torznab envía la `apikey` en la *query string*, usá `localhost` o **HTTPS** en despliegues remotos. / Base URL for Jackett (default `http://localhost:9117`). Since Torznab sends `apikey` in the query string, prefer `localhost` or **HTTPS** remotely.
+  - `JACKETT_API_KEY`: clave API explícita de Jackett. / Explicit Jackett API key.
+  - `JACKETT_CONFIG`: ruta explícita a `ServerConfig.json` (alternativa a `~/media-stack/...` o `~/.config/Jackett/ServerConfig.json`). / Explicit path to `ServerConfig.json`.
+  - `INCLUDE_LAN_JACKETT=1`: solo para builds locales privados con `./scripts/package-linux.sh`; por defecto **desactivado** para no incrustar tu API key LAN en `.deb`/`.AppImage`. / Opt-in for private local builds only; disabled by default so your local Jackett API key is never embedded in distributed packages.
+- **Exposición de IP en BitTorrent / BitTorrent IP exposure**: `librqbit` escucha en los puertos `4240–4260` con DHT habilitado y comparte piezas (*seeding*), por lo que tu IP pública es visible para los pares del enjambre. / `librqbit` listens on ports `4240–4260` with DHT enabled and seeds pieces, exposing your IP address to peers.
+- **Permisos locales / Local permissions**: en sistemas Unix, `data_dir` se restringe a `0700` y `library.db` (donde puede guardarse `jackett_api_key`) a `0600`. / On Unix systems, `data_dir` is restricted to `0700` and `library.db` to `0600`.
+
 ## Licencia / License
 MIT — ver [LICENSE](LICENSE).

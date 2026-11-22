@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table
 use ratatui::Frame;
 use rust_audio_core::{I18n, ScanStatus};
 use rust_audio_player::{AudioBackendKind, PlaybackState};
+use rust_audio_source_torrent::redact_url_secrets;
 
 use crate::app::{App, PlaylistPanelFocus, Tab, TorrentInputMode};
 
@@ -479,10 +480,11 @@ fn draw_torrents(frame: &mut Frame, app: &App, area: Rect) {
     let m_cursor = if app.torrent_input_mode == TorrentInputMode::Magnet { "█" } else { "" };
     let u_cursor = if app.torrent_input_mode == TorrentInputMode::JackettUrl { "█" } else { "" };
 
-    let jackett_hint = app
-        .search_provider
-        .jackett_endpoint_hint()
-        .unwrap_or("no-jackett");
+    let jackett_hint = redact_url_secrets(
+        app.search_provider
+            .jackett_endpoint_hint()
+            .unwrap_or("no-jackett"),
+    );
     let search_box = Paragraph::new(format!("[s] {}{}{}", app.i18n.torrents_search_prompt(), app.torrent_query, s_cursor))
         .block(
             Block::default()
@@ -500,13 +502,15 @@ fn draw_torrents(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(search_box, chunks[0]);
 
     let (second_text, second_focused) = if app.torrent_input_mode == TorrentInputMode::JackettUrl {
+        let safe_jackett_url = redact_url_secrets(&app.jackett_url_input);
         (
-            format!("[u] {}{}{}", app.i18n.torrents_jackett_prompt(), app.jackett_url_input, u_cursor),
+            format!("[u] {}{}{}", app.i18n.torrents_jackett_prompt(), safe_jackett_url, u_cursor),
             true,
         )
     } else {
+        let safe_magnet = redact_url_secrets(&app.torrent_magnet_input);
         (
-            format!("[m] {}{}{}", app.i18n.torrents_magnet_prompt(), app.torrent_magnet_input, m_cursor),
+            format!("[m] {}{}{}", app.i18n.torrents_magnet_prompt(), safe_magnet, m_cursor),
             app.torrent_input_mode == TorrentInputMode::Magnet,
         )
     };

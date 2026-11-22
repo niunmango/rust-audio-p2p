@@ -33,9 +33,37 @@ impl AppPaths {
 
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.data_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.data_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         std::fs::create_dir_all(&self.cache_dir)?;
         std::fs::create_dir_all(&self.offline_pins_dir)?;
         std::fs::create_dir_all(&self.torrent_download_dir)?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn test_ensure_dirs_restricts_data_dir_permissions() {
+        let temp = std::env::temp_dir().join(format!("rust_audio_cfg_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let paths = AppPaths {
+            data_dir: temp.join("data"),
+            cache_dir: temp.join("cache/media"),
+            offline_pins_dir: temp.join("cache/offline"),
+            torrent_download_dir: temp.join("cache/torrents"),
+            db_path: temp.join("data/library.db"),
+        };
+        paths.ensure_dirs().unwrap();
+        let mode = std::fs::metadata(&paths.data_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

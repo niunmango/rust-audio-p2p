@@ -23,6 +23,11 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         let db = Self { conn };
         db.init_schema()?;
         Ok(db)
@@ -612,5 +617,21 @@ mod tests {
         let pinned_now = db.toggle_playlist_pin(pl_id).unwrap();
         assert!(pinned_now);
         assert_eq!(db.list_pinned_tracks().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_database_open_restricts_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = std::env::temp_dir().join(format!("rust_audio_db_perm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let db_path = temp.join("library.db");
+        let db = Database::open(&db_path).unwrap();
+        drop(db);
+
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

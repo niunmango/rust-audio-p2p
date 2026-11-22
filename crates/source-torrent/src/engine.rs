@@ -48,7 +48,7 @@ pub fn extract_magnet_display_name(raw: &str) -> String {
                 if let Ok(decoded) = urlencoding::decode(&plus_fixed) {
                     let s = decoded.trim().to_string();
                     if !s.is_empty() {
-                        return s;
+                        return crate::search::redact_url_secrets(&s);
                     }
                 }
             }
@@ -62,13 +62,42 @@ pub fn extract_magnet_display_name(raw: &str) -> String {
             return fb;
         }
     }
-    if let Some(name) = uri.rsplit('/').next() {
+    if uri.contains("://") {
+        let (path_part, query_opt) = match uri.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (uri.as_str(), None),
+        };
+        if let Some(q) = query_opt {
+            for part in q.split('&') {
+                if let Some(file_val) = part.strip_prefix("file=") {
+                    let file_val = file_val.split('#').next().unwrap_or(file_val);
+                    let plus_fixed = file_val.replace('+', " ");
+                    if let Ok(decoded) = urlencoding::decode(&plus_fixed) {
+                        let clean = crate::search::redact_url_secrets(decoded.trim());
+                        if !clean.is_empty() {
+                            return clean;
+                        }
+                    }
+                }
+            }
+        }
+        let clean_path = path_part.split('#').next().unwrap_or(path_part);
+        if let Some(name) = clean_path.rsplit('/').next() {
+            let s = name.trim();
+            if !s.is_empty() {
+                return crate::search::redact_url_secrets(s);
+            }
+        }
+    } else if let Some(name) = uri.rsplit('/').next() {
         let s = name.trim();
         if !s.is_empty() {
-            return s.to_string();
+            return crate::search::redact_url_secrets(s);
         }
     }
-    uri.chars().take(40).collect()
+    crate::search::redact_url_secrets(&uri)
+        .chars()
+        .take(40)
+        .collect()
 }
 
 fn append_fallback_trackers_if_missing(uri: &str) -> String {
@@ -280,5 +309,21 @@ mod tests {
 
         let with_tr = append_fallback_trackers_if_missing(&fixed);
         assert!(with_tr.contains("&tr=udp%3A%2F%2Ftracker.opentrackr.org"));
+    }
+
+    #[test]
+    fn test_extract_display_name_redacts_jackett_apikey() {
+        let url_with_file = "http://localhost:9117/dl/tpb/?jackett_apikey=SUPERSECRET&path=abc&file=Almendra+FLAC.torrent";
+        assert_eq!(
+            extract_magnet_display_name(url_with_file),
+            "Almendra FLAC.torrent"
+        );
+
+        let url_no_file = "http://localhost:9117/dl/tpb/?jackett_apikey=SUPERSECRET";
+        let name = extract_magnet_display_name(url_no_file);
+        assert!(!name.contains("SUPERSECRET"));
+
+        let short_url = "http://h/?apikey=SUPERSECRET";
+        assert!(!extract_magnet_display_name(short_url).contains("SUPERSECRET"));
     }
 }
