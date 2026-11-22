@@ -1,5 +1,13 @@
-//! Core domain models, SQLite + FTS5 persistence, i18n, LRU cache, offline pins, and playback queue.
+pub mod cache;
+pub mod config;
+pub mod db;
+pub mod i18n;
+pub mod models;
+pub mod queue;
 
-pub fn crate_name() -> &'static str {
-    "rust-audio-core"
-}
+pub use cache::{EvictionReport, LruCacheManager};
+pub use config::{AppPaths, DEFAULT_CACHE_LIMIT_BYTES};
+pub use db::Database;
+pub use i18n::{detect_system_language, I18n, Language, LanguagePreference};
+pub use models::{Album, Artist, CacheEntry, CacheStats, Playlist, ScanStatus, Track, TrackSource};
+pub use queue::PlaybackQueue;

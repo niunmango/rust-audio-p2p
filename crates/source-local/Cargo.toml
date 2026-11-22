@@ -6,3 +6,9 @@ license.workspace = true
 
 [dependencies]
 rust-audio-core = { path = "../core" }
+walkdir = "2.5"
+notify = "8"
+lofty = "0.22"
+tokio = { version = "1", features = ["full"] }
+dirs = "6"
+anyhow = "1"
