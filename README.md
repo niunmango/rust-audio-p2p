@@ -39,5 +39,17 @@ Genera en `dist/`:
 - `rust-audio-p2p_0.1.0_amd64.deb` (`sudo apt install ./dist/rust-audio-p2p_0.1.0_amd64.deb`)
 - `rust-audio-p2p-0.1.0-x86_64.AppImage` (`chmod +x dist/*.AppImage && ./dist/rust-audio-p2p-0.1.0-x86_64.AppImage`)
 
+---
+
+## Seguridad y privacidad / Security & privacy
+
+- **Variables de entorno / Environment variables**:
+  - `JACKETT_URL`: URL base de Jackett (por defecto `http://localhost:9117`). Como Torznab envía la `apikey` en la *query string*, se recomienda usar `localhost` o **HTTPS** en despliegues remotos.
+  - `JACKETT_API_KEY`: clave API de Jackett (alternativa explícita a la autodetección de configuración).
+  - `JACKETT_CONFIG`: ruta explícita a `ServerConfig.json` si no se encuentra en `$XDG_CONFIG_HOME/Jackett/ServerConfig.json` o `~/.config/Jackett/ServerConfig.json`.
+  - `RUST_AUDIO_SELFTEST_MUSIC_DIR`: directorio opcional de música para `--self-test` cuando no se pasa `--scan-dir`.
+- **Exposición de IP en BitTorrent / BitTorrent IP exposure**: el motor `librqbit` escucha en los puertos `4240–4260` con DHT habilitado y comparte piezas con pares (*seeding*), por lo que tu dirección IP pública será visible para los pares del enjambre. / `librqbit` listens on ports `4240–4260` with DHT enabled and seeds pieces to peers, so your IP address is visible to the swarm.
+- **Permisos locales / Local permissions**: el directorio de datos (`library.db`) se crea con permisos `0700` en sistemas Unix. / The data directory (`library.db`) is created with `0700` permissions on Unix systems.
+
 ## Licencia / License
 MIT — ver [LICENSE](LICENSE).

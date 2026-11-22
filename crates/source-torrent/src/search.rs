@@ -1,8 +1,54 @@
-use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+const MAX_TORZNAB_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const SECRET_PARAM_PREFIXES: &[&str] = &["apikey=", "api_key=", "passkey=", "token="];
+
+/// Redacts sensitive query parameter values (such as Jackett `apikey` / `jackett_apikey`,
+/// `api_key`, `passkey`, and `token`) from URLs and error strings before logging,
+/// rendering in the UI, or persisting to SQLite.
+pub fn redact_url_secrets(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut pos = 0usize;
+
+    while pos < lower.len() {
+        let mut earliest: Option<(usize, usize)> = None;
+        for pat in SECRET_PARAM_PREFIXES {
+            if let Some(rel) = lower[pos..].find(pat) {
+                let candidate = (pos + rel, pat.len());
+                if earliest.is_none_or(|best| candidate.0 < best.0) {
+                    earliest = Some(candidate);
+                }
+            }
+        }
+
+        let Some((match_start, key_len)) = earliest else {
+            break;
+        };
+
+        let val_start = match_start + key_len;
+        let val_end = input[val_start..]
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '&' | '"' | '\'' | ')' | '>' | '#')
+            })
+            .map(|off| val_start + off)
+            .unwrap_or(input.len());
+
+        out.push_str(&input[pos..val_start]);
+        out.push_str("***");
+        pos = val_end;
+    }
+
+    if pos == 0 {
+        return input.to_string();
+    }
+    out.push_str(&input[pos..]);
+    out
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentSearchResult {
@@ -46,13 +92,25 @@ impl TorznabSearchProvider {
                 return Some(Self::new(base_url, key.trim()));
             }
         }
-        let default_cfg = Path::new("/home/ramiro/media-stack/config/jackett/Jackett/ServerConfig.json");
-        if default_cfg.exists() {
-            if let Ok(raw) = std::fs::read_to_string(default_cfg) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
-                    if let Some(key) = val.get("APIKey").and_then(|v| v.as_str()) {
-                        if !key.trim().is_empty() {
-                            return Some(Self::new(base_url, key.trim()));
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(cfg) = std::env::var_os("JACKETT_CONFIG").filter(|v| !v.is_empty()) {
+            candidates.push(PathBuf::from(cfg));
+        }
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            candidates.push(PathBuf::from(xdg).join("Jackett/ServerConfig.json"));
+        } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            candidates.push(PathBuf::from(home).join(".config/Jackett/ServerConfig.json"));
+        }
+
+        for cfg_path in candidates {
+            if cfg_path.exists() {
+                if let Ok(raw) = std::fs::read_to_string(&cfg_path) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        if let Some(key) = val.get("APIKey").and_then(|v| v.as_str()) {
+                            if !key.trim().is_empty() {
+                                return Some(Self::new(base_url, key.trim()));
+                            }
                         }
                     }
                 }
@@ -75,7 +133,37 @@ impl TorrentSearchProvider for TorznabSearchProvider {
             "{}/api/v2.0/indexers/all/results/torznab/api?apikey={}&t=search&cat=3000,3010,3040&q={}",
             self.base_url, key, q
         );
-        let xml = self.client.get(&url).send().await?.text().await?;
+        let mut resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("request failed: {}", e.without_url()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("HTTP {}", status);
+        }
+        if let Some(len) = resp.content_length() {
+            if len > MAX_TORZNAB_RESPONSE_BYTES as u64 {
+                anyhow::bail!(
+                    "Torznab response too large ({len} bytes > {MAX_TORZNAB_RESPONSE_BYTES} byte limit)"
+                );
+            }
+        }
+        let mut buf = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| anyhow::anyhow!("read failed: {}", e.without_url()))?
+        {
+            if buf.len().saturating_add(chunk.len()) > MAX_TORZNAB_RESPONSE_BYTES {
+                anyhow::bail!(
+                    "Torznab response exceeded {MAX_TORZNAB_RESPONSE_BYTES} byte limit"
+                );
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let xml = String::from_utf8_lossy(&buf);
         Ok(parse_torznab_xml(&xml, self.provider_name()))
     }
 }
@@ -247,7 +335,7 @@ impl CompositeSearchProvider {
         for p in &self.providers {
             match p.search(query).await {
                 Ok(mut items) => merged.append(&mut items),
-                Err(e) => errors.push(format!("{}: {}", p.provider_name(), e)),
+                Err(e) => errors.push(redact_url_secrets(&format!("{}: {}", p.provider_name(), e))),
             }
         }
         (merged, errors)
@@ -291,5 +379,28 @@ mod tests {
         let res = p.search("bach").await.unwrap();
         assert_eq!(res.len(), 1);
         assert!(res[0].title.contains("Bach"));
+    }
+
+    #[test]
+    fn test_redact_url_secrets() {
+        assert_eq!(
+            redact_url_secrets("http://localhost:9117/dl/x/?jackett_apikey=abc123&path=Q&file=f"),
+            "http://localhost:9117/dl/x/?jackett_apikey=***&path=Q&file=f"
+        );
+        assert_eq!(
+            redact_url_secrets("GET http://h/api?apikey=SECRET returned 404"),
+            "GET http://h/api?apikey=*** returned 404"
+        );
+        assert_eq!(redact_url_secrets("APIKEY=Z"), "APIKEY=***");
+        assert_eq!(
+            redact_url_secrets("token=t1&passkey=p2&api_key=k3"),
+            "token=***&passkey=***&api_key=***"
+        );
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Kevin+MacLeod";
+        assert_eq!(redact_url_secrets(magnet), magnet);
+        assert_eq!(
+            redact_url_secrets("Almendra – ñ apikey=x"),
+            "Almendra – ñ apikey=***"
+        );
     }
 }

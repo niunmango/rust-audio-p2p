@@ -11,7 +11,8 @@ use rust_audio_core::{
 use rust_audio_player::PlayerEngine;
 use rust_audio_source_local::{spawn_home_scan, RecommendedWatcher};
 use rust_audio_source_torrent::{
-    CompositeSearchProvider, TorrentEngine, TorrentSearchResult, TorrentStatusSnapshot,
+    redact_url_secrets, CompositeSearchProvider, TorrentEngine, TorrentSearchResult,
+    TorrentStatusSnapshot,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -306,7 +307,7 @@ impl App {
                     self.torrent_engine = Some(engine);
                 }
                 AsyncEvent::TorrentEngineError(err) => {
-                    self.status_message = format!("Torrent init: {err}");
+                    self.status_message = format!("Torrent init: {}", redact_url_secrets(&err));
                 }
                 AsyncEvent::TorrentSearchFinished(results, errors) => {
                     self.torrent_searching = false;
@@ -337,7 +338,7 @@ impl App {
                                 cover_path: None,
                                 source: TrackSource::Torrent {
                                     info_hash: snap.info_hash.clone(),
-                                    magnet_uri: self.torrent_magnet_input.clone(),
+                                    magnet_uri: redact_url_secrets(&self.torrent_magnet_input),
                                     file_index: 0,
                                     cached_path: None,
                                 },
@@ -348,7 +349,7 @@ impl App {
                         need_refresh = true;
                     }
                     Err(e) => {
-                        self.status_message = format!("Torrent err: {e}");
+                        self.status_message = format!("Torrent err: {}", redact_url_secrets(&e));
                     }
                 },
             }
@@ -605,7 +606,10 @@ impl App {
         };
         let tx = self.async_tx.clone();
         tokio::spawn(async move {
-            let res = engine.add_magnet(&uri).await.map_err(|e| e.to_string());
+            let res = engine
+                .add_magnet(&uri)
+                .await
+                .map_err(|e| redact_url_secrets(&format!("{e:#}")));
             let _ = tx.send(AsyncEvent::TorrentAdded(res));
         });
     }

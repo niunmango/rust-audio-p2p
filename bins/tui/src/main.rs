@@ -2,7 +2,7 @@ mod app;
 mod ui;
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -677,12 +677,15 @@ async fn run_self_test(scan_override: Option<PathBuf>) -> Result<()> {
 
     let db = Database::open(&paths.db_path)?;
     let scan_root = scan_override.unwrap_or_else(|| {
-        let local_music = Path::new("/home/ramiro/media-stack/data/media/music");
-        if local_music.exists() {
-            local_music.to_path_buf()
-        } else {
-            default_scan_root()
+        if let Some(env_dir) =
+            std::env::var_os("RUST_AUDIO_SELFTEST_MUSIC_DIR").filter(|v| !v.is_empty())
+        {
+            let candidate = PathBuf::from(env_dir);
+            if candidate.exists() {
+                return candidate;
+            }
         }
+        default_scan_root()
     });
 
     let mut app = App::new(

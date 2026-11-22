@@ -6,6 +6,6 @@ pub use engine::{
     DEFAULT_PORT_RANGE_START,
 };
 pub use search::{
-    parse_torznab_xml, CompositeSearchProvider, OpenAudioFallbackProvider, TorrentSearchProvider,
-    TorrentSearchResult, TorznabSearchProvider,
+    parse_torznab_xml, redact_url_secrets, CompositeSearchProvider, OpenAudioFallbackProvider,
+    TorrentSearchProvider, TorrentSearchResult, TorznabSearchProvider,
 };

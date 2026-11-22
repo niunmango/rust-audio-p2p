@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table
 use ratatui::Frame;
 use rust_audio_core::{I18n, ScanStatus};
 use rust_audio_player::{AudioBackendKind, PlaybackState};
+use rust_audio_source_torrent::redact_url_secrets;
 
 use crate::app::{App, PlaylistPanelFocus, Tab, TorrentInputMode};
 
@@ -491,7 +492,8 @@ fn draw_torrents(frame: &mut Frame, app: &App, area: Rect) {
         );
     frame.render_widget(search_box, chunks[0]);
 
-    let magnet_box = Paragraph::new(format!("[m] {}{}{}", app.i18n.torrents_magnet_prompt(), app.torrent_magnet_input, m_cursor))
+    let magnet_display = redact_url_secrets(&app.torrent_magnet_input);
+    let magnet_box = Paragraph::new(format!("[m] {}{}{}", app.i18n.torrents_magnet_prompt(), magnet_display, m_cursor))
         .block(
             Block::default()
                 .borders(Borders::ALL)
