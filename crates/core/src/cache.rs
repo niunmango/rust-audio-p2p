@@ -1,10 +1,34 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
 
 use crate::config::DEFAULT_CACHE_LIMIT_BYTES;
 use crate::db::Database;
 use crate::models::{CacheStats, Track, TrackSource};
+
+fn safe_remove_in_dir(base_dir: &Path, target: &Path) {
+    if target
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(target) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    let (Ok(canon_base), Ok(canon_target)) = (
+        std::fs::canonicalize(base_dir),
+        std::fs::canonicalize(target),
+    ) else {
+        return;
+    };
+    if canon_target.starts_with(&canon_base) && canon_target != canon_base {
+        let _ = std::fs::remove_file(&canon_target);
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct EvictionReport {
@@ -109,9 +133,7 @@ impl LruCacheManager {
                 continue;
             }
             let p = Path::new(&entry.file_path);
-            if p.exists() && p.starts_with(&self.cache_dir) {
-                let _ = std::fs::remove_file(p);
-            }
+            safe_remove_in_dir(&self.cache_dir, p);
             db.remove_cache_entry(&entry.cache_key)?;
             stats.used_bytes = stats.used_bytes.saturating_sub(entry.size_bytes);
             report.evicted_count += 1;
@@ -128,9 +150,7 @@ impl LruCacheManager {
                 continue;
             }
             let p = Path::new(&entry.file_path);
-            if p.exists() && p.starts_with(&self.cache_dir) {
-                let _ = std::fs::remove_file(p);
-            }
+            safe_remove_in_dir(&self.cache_dir, p);
             db.remove_cache_entry(&entry.cache_key)?;
             report.evicted_count += 1;
             report.freed_bytes += entry.size_bytes;
@@ -171,6 +191,29 @@ mod tests {
         assert!(f2.exists(), "pinned file must NEVER be evicted");
         assert!(f3.exists(), "newest unpinned file should remain within 120B limit");
 
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_eviction_refuses_traversal_outside_cache_dir() {
+        let temp = std::env::temp_dir().join(format!("rust_audio_lru_trav_{}", std::process::id()));
+        let cache_dir = temp.join("media");
+        let offline_dir = temp.join("offline");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::create_dir_all(&offline_dir).unwrap();
+
+        let outside = temp.join("outside.bin");
+        std::fs::write(&outside, vec![1u8; 80]).unwrap();
+        let traversal = cache_dir.join("../outside.bin");
+
+        let db = Database::open_in_memory().unwrap();
+        let mgr = LruCacheManager::new(cache_dir, offline_dir, 50);
+        let _ = mgr
+            .register_torrent_file(&db, None, "trav", &traversal, 80, false)
+            .unwrap();
+
+        assert!(outside.exists(), "file outside cache_dir must NEVER be deleted");
         let _ = std::fs::remove_dir_all(&temp);
     }
 }

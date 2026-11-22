@@ -7,34 +7,51 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pages: write
+  contents: read
 
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Install Linux build & packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libasound2-dev dpkg-dev apt-utils fakeroot
+          sudo apt-get install -y pkg-config libasound2-dev dpkg-dev apt-utils fakeroot gnupg
 
       - name: Run workspace tests
         run: cargo test --workspace
 
       - name: Build release binary
         run: cargo build --release -p rust-audio-tui
+
+      - name: Prepare optional APT GPG signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [[ -n "$APT_GPG_PRIVATE_KEY" ]]; then
+            GNUPGHOME="${{ runner.temp }}/apt-gnupg"
+            mkdir -p "$GNUPGHOME"
+            chmod 0700 "$GNUPGHOME"
+            export GNUPGHOME
+            printf '%s\n' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+            gpg --batch --export > "${{ runner.temp }}/rust-audio-p2p.gpg"
+            echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+            echo "APT_GPG_PUBLIC_KEY_FILE=${{ runner.temp }}/rust-audio-p2p.gpg" >> "$GITHUB_ENV"
+          fi
 
       - name: Package .deb and .AppImage
         env:
@@ -49,6 +66,7 @@ jobs:
       - name: Build APT repository metadata for GitHub Pages
         env:
           PKG_VERSION: "0.1.${{ github.run_number }}"
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: |
           mkdir -p dist/apt-repo
           cp "dist/rust-audio-p2p_${PKG_VERSION}_amd64.deb" dist/apt-repo/
@@ -64,9 +82,20 @@ jobs:
               -o APT::FTPArchive::Release::Architectures="amd64" \
               -o APT::FTPArchive::Release::Components="main" \
               release . > Release
+            if [[ -n "${GNUPGHOME:-}" ]] && [[ -f "${APT_GPG_PUBLIC_KEY_FILE:-}" ]]; then
+              if [[ -n "${APT_GPG_PASSPHRASE:-}" ]]; then
+                printf '%s' "$APT_GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --armor --detach-sign -o Release.gpg Release
+                printf '%s' "$APT_GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --clearsign -o InRelease Release
+              else
+                gpg --batch --yes --armor --detach-sign -o Release.gpg Release
+                gpg --batch --yes --clearsign -o InRelease Release
+              fi
+              cp "$APT_GPG_PUBLIC_KEY_FILE" ./rust-audio-p2p.gpg
+            fi
           )
           cp dist/rust-audio-p2p_latest_amd64.deb dist/apt-repo/
           cp dist/rust-audio-p2p-latest-x86_64.AppImage dist/apt-repo/
+          cp dist/SHA256SUMS.txt dist/apt-repo/
           printf '%s\n' \
             '<!doctype html>' \
             '<html lang="en">' \
@@ -78,13 +107,14 @@ jobs:
             "    <li><a href=\"rust-audio-p2p_${PKG_VERSION}_amd64.deb\">rust-audio-p2p_${PKG_VERSION}_amd64.deb</a></li>" \
             '    <li><a href="rust-audio-p2p_latest_amd64.deb">rust-audio-p2p_latest_amd64.deb</a></li>' \
             '    <li><a href="rust-audio-p2p-latest-x86_64.AppImage">rust-audio-p2p-latest-x86_64.AppImage</a></li>' \
+            '    <li><a href="SHA256SUMS.txt">SHA256SUMS.txt</a></li>' \
             '  </ul>' \
             '  <pre>sudo apt update &amp;&amp; sudo apt upgrade</pre>' \
             '</body>' \
             '</html>' > dist/apt-repo/index.html
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: "v0.1.${{ github.run_number }}"
           name: "v0.1.${{ github.run_number }}"
@@ -92,10 +122,15 @@ jobs:
           files: |
             dist/rust-audio-p2p_*.deb
             dist/rust-audio-p2p-*.AppImage
+            dist/SHA256SUMS.txt
 
       - name: Deploy APT repository to GitHub Pages (gh-pages)
-        uses: peaceiris/actions-gh-pages@v4
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./dist/apt-repo
           keep_files: false
+
+      - name: Clean up temporary GPG keyring
+        if: always()
+        run: rm -rf "${{ runner.temp }}/apt-gnupg" "${{ runner.temp }}/rust-audio-p2p.gpg"

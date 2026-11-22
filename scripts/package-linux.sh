@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMMIT_COUNT="$(git -C "$ROOT_DIR" rev-list --count HEAD 2>/dev/null || echo 1)"
 VERSION="${PKG_VERSION:-0.1.${COMMIT_COUNT}}"
+if [[ ! "$VERSION" =~ ^[0-9A-Za-z.+~-]+$ ]]; then
+  echo "ERROR: invalid PKG_VERSION '$VERSION'" >&2
+  exit 1
+fi
 BIN_PATH="$ROOT_DIR/target/release/rust-audio-tui"
 DIST_DIR="$ROOT_DIR/dist"
 
@@ -55,9 +59,17 @@ if [[ -f "$LAN_JACKETT_TMP" ]]; then
   install -m 0644 "$LAN_JACKETT_TMP" "$DEB_STAGE/usr/share/rust-audio-p2p/lan-jackett.json"
 fi
 
-cat << 'EOF' > "$DEB_STAGE/etc/apt/sources.list.d/rust-audio-p2p.list"
+if [[ -n "${APT_GPG_PUBLIC_KEY_FILE:-}" ]] && [[ -f "$APT_GPG_PUBLIC_KEY_FILE" ]]; then
+  mkdir -p "$DEB_STAGE/usr/share/keyrings"
+  install -m 0644 "$APT_GPG_PUBLIC_KEY_FILE" "$DEB_STAGE/usr/share/keyrings/rust-audio-p2p.gpg"
+  cat << 'EOF' > "$DEB_STAGE/etc/apt/sources.list.d/rust-audio-p2p.list"
+deb [arch=amd64 signed-by=/usr/share/keyrings/rust-audio-p2p.gpg] https://niunmango.github.io/rust-audio-p2p ./
+EOF
+else
+  cat << 'EOF' > "$DEB_STAGE/etc/apt/sources.list.d/rust-audio-p2p.list"
 deb [arch=amd64 trusted=yes] https://niunmango.github.io/rust-audio-p2p ./
 EOF
+fi
 chmod 0644 "$DEB_STAGE/etc/apt/sources.list.d/rust-audio-p2p.list"
 
 cat << 'EOF' > "$DEB_STAGE/DEBIAN/conffiles"
@@ -153,8 +165,9 @@ SELF_STAMP="\$(stat -c '%Y:%s' "\$SELF_BIN" 2>/dev/null || echo 1)"
 if [[ ! -f "\$MARKER" ]] || [[ "\$(cat "\$MARKER" 2>/dev/null || true)" != "\$SELF_STAMP" ]]; then
   rm -rf "\$CACHE_ROOT"
   mkdir -p "\$CACHE_ROOT"
+  chmod 0700 "\$CACHE_ROOT"
   ARCHIVE_LINE=\$(awk '/^__APPIMAGE_ARCHIVE_BELOW__$/ {print NR + 1; exit 0;}' "\$SELF_BIN")
-  tail -n +"\$ARCHIVE_LINE" "\$SELF_BIN" | tar -xz -C "\$CACHE_ROOT"
+  tail -n +"\$ARCHIVE_LINE" "\$SELF_BIN" | tar --no-same-owner -xz -C "\$CACHE_ROOT"
   echo "\$SELF_STAMP" > "\$MARKER"
 fi
 
@@ -166,6 +179,15 @@ chmod 0755 "$APPIMAGE_OUT"
 cp "$APPIMAGE_OUT" "$DIST_DIR/rust-audio-p2p-latest-x86_64.AppImage"
 rm -f "$PAYLOAD_TGZ" "$LAN_JACKETT_TMP"
 rm -rf "$APPDIR"
+
+(
+  cd "$DIST_DIR"
+  sha256sum \
+    "rust-audio-p2p_${VERSION}_amd64.deb" \
+    "rust-audio-p2p_latest_amd64.deb" \
+    "rust-audio-p2p-${VERSION}-x86_64.AppImage" \
+    "rust-audio-p2p-latest-x86_64.AppImage" > SHA256SUMS.txt
+)
 
 echo "Built portable AppImage: $APPIMAGE_OUT"
 ls -lh "$DIST_DIR"
