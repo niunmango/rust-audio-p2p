@@ -12,6 +12,12 @@ pub enum TrackSource {
         file_index: usize,
         cached_path: Option<String>,
     },
+    Peer {
+        node_id: String,
+        node_name: String,
+        remote_track_id: i64,
+        cached_path: Option<String>,
+    },
 }
 
 impl TrackSource {
@@ -19,6 +25,7 @@ impl TrackSource {
         match self {
             TrackSource::LocalFile { .. } => "local",
             TrackSource::Torrent { .. } => "torrent",
+            TrackSource::Peer { .. } => "peer",
         }
     }
 
@@ -30,6 +37,11 @@ impl TrackSource {
                 file_index,
                 ..
             } => format!("torrent:{}:{}", info_hash, file_index),
+            TrackSource::Peer {
+                node_id,
+                remote_track_id,
+                ..
+            } => format!("peer:{}:{}", node_id, remote_track_id),
         }
     }
 
@@ -37,6 +49,7 @@ impl TrackSource {
         match self {
             TrackSource::LocalFile { path } => Some(path.as_str()),
             TrackSource::Torrent { cached_path, .. } => cached_path.as_deref(),
+            TrackSource::Peer { cached_path, .. } => cached_path.as_deref(),
         }
     }
 }
@@ -99,6 +112,16 @@ pub struct CacheStats {
     pub limit_bytes: u64,
     pub entry_count: usize,
     pub pinned_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedPeer {
+    pub node_id: String,
+    pub node_name: String,
+    pub endpoint: String,
+    pub auth_token: String,
+    pub track_count: usize,
+    pub playlist_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

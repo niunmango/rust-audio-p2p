@@ -1,10 +1,11 @@
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::models::{CacheEntry, CacheStats, Playlist, Track, TrackSource};
+use crate::models::{CacheEntry, CacheStats, PairedPeer, Playlist, Track, TrackSource};
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -145,7 +146,42 @@ impl Database {
     pub fn upsert_track(&self, track: &Track) -> Result<i64> {
         let source_key = track.source.unique_key();
         let source_type = track.source.source_type();
-        let source_json = serde_json::to_string(&track.source)?;
+        let mut effective_source: Cow<'_, TrackSource> = Cow::Borrowed(&track.source);
+
+        if let TrackSource::Peer {
+            node_id,
+            node_name,
+            remote_track_id,
+            cached_path: None,
+        } = &track.source
+        {
+            if let Ok(Some(existing_json)) = self
+                .conn
+                .query_row(
+                    "SELECT source_json FROM tracks WHERE source_key = ?1",
+                    params![&source_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            {
+                if let Ok(TrackSource::Peer {
+                    cached_path: Some(existing_path),
+                    ..
+                }) = serde_json::from_str::<TrackSource>(&existing_json)
+                {
+                    if Path::new(&existing_path).exists() {
+                        effective_source = Cow::Owned(TrackSource::Peer {
+                            node_id: node_id.clone(),
+                            node_name: node_name.clone(),
+                            remote_track_id: *remote_track_id,
+                            cached_path: Some(existing_path),
+                        });
+                    }
+                }
+            }
+        }
+
+        let source_json = serde_json::to_string(effective_source.as_ref())?;
         let now = now_unix();
 
         self.conn.execute(
@@ -463,6 +499,40 @@ impl Database {
         Ok(())
     }
 
+    pub fn load_paired_peers(&self) -> Result<Vec<PairedPeer>> {
+        let Some(raw) = self.get_setting("paired_peers_json")? else {
+            return Ok(Vec::new());
+        };
+        if raw.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let peers: Vec<PairedPeer> = serde_json::from_str(&raw).unwrap_or_default();
+        Ok(peers)
+    }
+
+    pub fn save_paired_peers(&self, peers: &[PairedPeer]) -> Result<()> {
+        let json = serde_json::to_string(peers)?;
+        self.set_setting("paired_peers_json", &json)
+    }
+
+    pub fn list_peer_tracks(&self, limit: usize) -> Result<Vec<Track>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, source_key, source_json, title, artist, album, year, track_number, duration_secs, file_size_bytes, format, cover_path, pinned
+            FROM tracks
+            WHERE source_type = 'peer'
+            ORDER BY artist COLLATE NOCASE ASC, album COLLATE NOCASE ASC, COALESCE(track_number, 0) ASC, title COLLATE NOCASE ASC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit as i64], Self::row_to_track)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn upsert_cache_entry(
         &self,
         cache_key: &str,
@@ -632,6 +702,70 @@ mod tests {
 
         let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_paired_peers_and_peer_track_preserves_cache_and_pin() {
+        let temp = std::env::temp_dir().join(format!("rust_audio_peer_db_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let cached_file = temp.join("remote_1.flac");
+        std::fs::write(&cached_file, b"fLaCtest").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let peer = PairedPeer {
+            node_id: "0123456789abcdef".to_string(),
+            node_name: "air".to_string(),
+            endpoint: "192.168.1.10:4261".to_string(),
+            auth_token: "deadbeef".to_string(),
+            track_count: 1,
+            playlist_count: 0,
+        };
+        db.save_paired_peers(&[peer.clone()]).unwrap();
+        let loaded = db.load_paired_peers().unwrap();
+        assert_eq!(loaded, vec![peer]);
+
+        let t_cached = Track {
+            id: 0,
+            title: "Track Remote".to_string(),
+            artist: "Charly".to_string(),
+            album: "Piano Bar".to_string(),
+            year: Some(1984),
+            track_number: Some(1),
+            duration_secs: Some(200),
+            file_size_bytes: 8,
+            format: "flac".to_string(),
+            cover_path: None,
+            source: TrackSource::Peer {
+                node_id: "0123456789abcdef".to_string(),
+                node_name: "air".to_string(),
+                remote_track_id: 42,
+                cached_path: Some(cached_file.to_string_lossy().to_string()),
+            },
+            pinned: true,
+        };
+        db.upsert_track(&t_cached).unwrap();
+
+        // Resync with cached_path = None and pinned = false must preserve local valid cache & pin
+        let mut t_resync = t_cached.clone();
+        t_resync.pinned = false;
+        t_resync.source = TrackSource::Peer {
+            node_id: "0123456789abcdef".to_string(),
+            node_name: "air".to_string(),
+            remote_track_id: 42,
+            cached_path: None,
+        };
+        db.upsert_track(&t_resync).unwrap();
+
+        let peers_tracks = db.list_peer_tracks(10).unwrap();
+        assert_eq!(peers_tracks.len(), 1);
+        assert!(peers_tracks[0].pinned);
+        assert_eq!(
+            peers_tracks[0].source.playable_path(),
+            Some(cached_file.to_string_lossy().as_ref())
+        );
+
         let _ = std::fs::remove_dir_all(&temp);
     }
 }

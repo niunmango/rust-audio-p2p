@@ -1,14 +1,17 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::layout::Rect;
 use rust_audio_core::{
-    AppPaths, CacheStats, Database, I18n, LanguagePreference, LruCacheManager, PlaybackQueue,
-    Playlist, ScanStatus, Track, TrackSource,
+    AppPaths, CacheStats, Database, I18n, LanguagePreference, LruCacheManager, PairedPeer,
+    PlaybackQueue, Playlist, ScanStatus, Track, TrackSource,
+};
+use rust_audio_net_friends::{
+    FriendNodeClient, FriendNodeServer, NodeIdentity, PeerTicket, RemoteCatalogDto,
 };
 use rust_audio_player::PlayerEngine;
 use rust_audio_source_local::{extract_track_metadata, is_supported_audio, spawn_home_scan, RecommendedWatcher};
@@ -25,18 +28,26 @@ pub enum Tab {
     Playlists,
     Torrents,
     CacheSettings,
+    Friends,
 }
 
 impl Tab {
-    pub fn all() -> [Tab; 5] {
+    pub fn all() -> [Tab; 6] {
         [
             Tab::Library,
             Tab::Search,
             Tab::Playlists,
             Tab::Torrents,
             Tab::CacheSettings,
+            Tab::Friends,
         ]
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PeerDownloadIntent {
+    pub play_on_ready: bool,
+    pub pin_on_ready: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +74,7 @@ pub struct PlaylistPickerState {
 
 #[derive(Debug, Default, Clone)]
 pub struct UiLayout {
-    pub tab_rects: [Rect; 5],
+    pub tab_rects: [Rect; 6],
     pub library_table: Rect,
     pub library_scroll: usize,
     pub search_input: Rect,
@@ -79,6 +90,15 @@ pub struct UiLayout {
     pub torrent_results_table: Rect,
     pub torrent_results_scroll: usize,
     pub torrent_downloads_area: Rect,
+    pub peer_connect_input: Rect,
+    pub peer_discover_btn: Rect,
+    pub peer_lan_share_btn: Rect,
+    pub peer_qr_btn: Rect,
+    pub peer_list: Rect,
+    pub peer_list_scroll: usize,
+    pub peer_tracks_table: Rect,
+    pub peer_tracks_scroll: usize,
+    pub qr_modal_box: Rect,
     pub player_bar: Rect,
     pub player_gauge: Rect,
     pub auto_next_pill: Rect,
@@ -96,6 +116,28 @@ pub enum AsyncEvent {
     TorrentAdded {
         uri: String,
         result: Result<TorrentStatusSnapshot, String>,
+    },
+    P2pServerReady(Arc<FriendNodeServer>),
+    P2pServerError(String),
+    P2pLanDiscovered(Vec<PeerTicket>),
+    P2pPeerSynced {
+        peer: PairedPeer,
+        catalog: RemoteCatalogDto,
+    },
+    P2pPeerSyncFailed {
+        target: String,
+        error: String,
+    },
+    P2pTrackDownloaded {
+        source_key: String,
+        track: Track,
+        cached_path: String,
+        file_size: u64,
+    },
+    P2pTrackDownloadFailed {
+        source_key: String,
+        title: String,
+        error: String,
     },
 }
 
@@ -144,6 +186,18 @@ pub struct App {
     pub active_torrents: Vec<TorrentStatusSnapshot>,
     pub active_torrent_selected: usize,
     pub synced_torrent_hashes: HashSet<String>,
+    pub node_identity: NodeIdentity,
+    pub p2p_server: Option<Arc<FriendNodeServer>>,
+    pub p2p_client: FriendNodeClient,
+    pub paired_peers: Vec<PairedPeer>,
+    pub peer_selected: usize,
+    pub peer_tracks: Vec<Track>,
+    pub peer_track_selected: usize,
+    pub peer_connect_input: String,
+    pub peer_connect_editing: bool,
+    pub show_qr_modal: bool,
+    pub p2p_logs: Vec<String>,
+    pub pending_peer_downloads: HashMap<String, PeerDownloadIntent>,
     pub cache_stats: CacheStats,
     pub status_message: String,
     pub should_quit: bool,
@@ -188,6 +242,9 @@ impl App {
             limit_bytes,
         );
         let cache_stats = cache.stats(&db)?;
+        let node_identity = NodeIdentity::load_or_create(&db)?;
+        let paired_peers = db.load_paired_peers()?;
+        let p2p_client = FriendNodeClient::new();
 
         let db = Arc::new(Mutex::new(db));
         let player = if headless {
@@ -218,6 +275,46 @@ impl App {
                     }
                     Err(e) => {
                         let _ = tx.send(AsyncEvent::TorrentEngineError(e.to_string()));
+                    }
+                }
+            });
+
+            // Start lightweight P2P node server + initial LAN discovery + existing peers refresh
+            let p2p_db = Arc::clone(&db);
+            let p2p_id = node_identity.clone();
+            let p2p_tx = async_tx.clone();
+            let client_clone = p2p_client.clone();
+            let existing_peers = paired_peers.clone();
+            tokio::spawn(async move {
+                match FriendNodeServer::start(p2p_db, p2p_id).await {
+                    Ok(srv) => {
+                        let srv_arc = Arc::new(srv);
+                        let _ = p2p_tx.send(AsyncEvent::P2pServerReady(Arc::clone(&srv_arc)));
+                    }
+                    Err(e) => {
+                        let _ = p2p_tx.send(AsyncEvent::P2pServerError(e.to_string()));
+                    }
+                }
+                let found = client_clone
+                    .discover_lan_peers(Duration::from_millis(900))
+                    .await;
+                if !found.is_empty() {
+                    let _ = p2p_tx.send(AsyncEvent::P2pLanDiscovered(found));
+                }
+                for peer in existing_peers {
+                    let ticket = PeerTicket {
+                        node_id: peer.node_id.clone(),
+                        node_name: peer.node_name.clone(),
+                        endpoint: peer.endpoint.clone(),
+                        auth_token: peer.auth_token.clone(),
+                    };
+                    if let Ok((updated_peer, catalog)) =
+                        client_clone.resolve_and_sync_peer(&ticket.to_uri()).await
+                    {
+                        let _ = p2p_tx.send(AsyncEvent::P2pPeerSynced {
+                            peer: updated_peer,
+                            catalog,
+                        });
                     }
                 }
             });
@@ -268,6 +365,18 @@ impl App {
             active_torrents: Vec::new(),
             active_torrent_selected: 0,
             synced_torrent_hashes: HashSet::new(),
+            node_identity,
+            p2p_server: None,
+            p2p_client,
+            paired_peers,
+            peer_selected: 0,
+            peer_tracks: Vec::new(),
+            peer_track_selected: 0,
+            peer_connect_input: String::new(),
+            peer_connect_editing: false,
+            show_qr_modal: false,
+            p2p_logs: Vec::new(),
+            pending_peer_downloads: HashMap::new(),
             cache_stats,
             status_message: String::new(),
             should_quit: false,
@@ -282,6 +391,8 @@ impl App {
         self.active_tab = tab;
         self.search_editing = tab == Tab::Search;
         self.playlist_editing = false;
+        self.peer_connect_editing = false;
+        self.show_qr_modal = false;
         if tab == Tab::Torrents {
             if self.torrent_results.is_empty() && self.torrent_query.is_empty() {
                 self.torrent_input_mode = TorrentInputMode::Search;
@@ -320,6 +431,13 @@ impl App {
             self.playlist_track_selected = self.selected_playlist_tracks.len() - 1;
         }
         self.pinned_tracks = guard.list_pinned_tracks()?;
+        self.peer_tracks = guard.list_peer_tracks(2000)?;
+        if self.peer_track_selected >= self.peer_tracks.len() && !self.peer_tracks.is_empty() {
+            self.peer_track_selected = self.peer_tracks.len() - 1;
+        }
+        if self.peer_selected >= self.paired_peers.len() && !self.paired_peers.is_empty() {
+            self.peer_selected = self.paired_peers.len() - 1;
+        }
         self.cache_stats = self.cache.stats(&guard)?;
         Ok(())
     }
@@ -415,6 +533,103 @@ impl App {
                         }
                     }
                 }
+                AsyncEvent::P2pServerReady(srv) => {
+                    let ticket = srv.ticket();
+                    self.push_p2p_log(format!(
+                        "[OK] Nodo P2P escuchando en {} (LAN Share: {})",
+                        ticket.endpoint,
+                        if srv.is_lan_share_enabled() { "ON" } else { "OFF" }
+                    ));
+                    self.p2p_server = Some(srv);
+                }
+                AsyncEvent::P2pServerError(err) => {
+                    self.push_p2p_log(format!("[ERR] Servidor P2P: {err}"));
+                }
+                AsyncEvent::P2pLanDiscovered(tickets) => {
+                    let my_id = self.node_identity.node_id.clone();
+                    let remote_tickets: Vec<PeerTicket> =
+                        tickets.into_iter().filter(|t| t.node_id != my_id).collect();
+                    if remote_tickets.is_empty() {
+                        self.push_p2p_log("[INFO] Escaneo LAN: sin otros nodos detectados".to_string());
+                    } else {
+                        for ticket in remote_tickets {
+                            self.push_p2p_log(format!(
+                                "[LAN] Nodo detectado: {} ({})",
+                                ticket.node_name, ticket.endpoint
+                            ));
+                            self.spawn_peer_sync(ticket.to_uri());
+                        }
+                    }
+                }
+                AsyncEvent::P2pPeerSynced { peer, catalog } => {
+                    if let Err(e) = self.apply_synced_peer(peer, catalog) {
+                        self.push_p2p_log(format!("[ERR] Error guardando catálogo P2P: {e}"));
+                    } else {
+                        need_refresh = true;
+                    }
+                }
+                AsyncEvent::P2pPeerSyncFailed { target, error } => {
+                    self.push_p2p_log(format!("[ERR] No se pudo conectar a '{target}': {error}"));
+                    self.status_message = format!("P2P err: {error}");
+                }
+                AsyncEvent::P2pTrackDownloaded {
+                    source_key,
+                    mut track,
+                    cached_path,
+                    file_size,
+                } => {
+                    let intent = self
+                        .pending_peer_downloads
+                        .remove(&source_key)
+                        .unwrap_or_default();
+                    if let TrackSource::Peer {
+                        cached_path: ref mut cp,
+                        ..
+                    } = track.source
+                    {
+                        *cp = Some(cached_path.clone());
+                    }
+                    track.file_size_bytes = file_size.max(track.file_size_bytes);
+                    if let Ok(guard) = self.db.lock() {
+                        if let Ok(tid) = guard.upsert_track(&track) {
+                            if intent.pin_on_ready {
+                                track.id = tid;
+                                let _ = self.cache.set_track_pin(&guard, &track, true);
+                            }
+                            let _ = self.cache.register_torrent_file(
+                                &guard,
+                                Some(tid),
+                                &source_key,
+                                Path::new(&cached_path),
+                                file_size,
+                                intent.pin_on_ready || track.pinned,
+                            );
+                        }
+                    }
+                    self.queue.update_track_cached_path(&source_key, &cached_path);
+                    self.push_p2p_log(format!(
+                        "[OK] Cacheado P2P: '{}' ({:.2} MB)",
+                        track.title,
+                        file_size as f64 / (1024.0 * 1024.0)
+                    ));
+                    need_refresh = true;
+                    if intent.play_on_ready {
+                        if self.queue.current().map(|c| c.source.unique_key())
+                            == Some(source_key)
+                        {
+                            let _ = self.play_current_in_queue();
+                        }
+                    }
+                }
+                AsyncEvent::P2pTrackDownloadFailed {
+                    source_key,
+                    title,
+                    error,
+                } => {
+                    self.pending_peer_downloads.remove(&source_key);
+                    self.push_p2p_log(format!("[ERR] Descarga P2P '{title}': {error}"));
+                    self.status_message = format!("P2P stream err: {error}");
+                }
             }
         }
         if let Some(engine) = &self.torrent_engine {
@@ -481,6 +696,7 @@ impl App {
         match self.active_tab {
             Tab::Library => self.tracks.get(self.library_selected).cloned(),
             Tab::Search => self.search_results.get(self.search_selected).cloned(),
+            Tab::Friends => self.peer_tracks.get(self.peer_track_selected).cloned(),
             Tab::Playlists if self.playlist_focus == PlaylistPanelFocus::PlaylistTracks => {
                 self.selected_playlist_tracks
                     .get(self.playlist_track_selected)
@@ -494,6 +710,7 @@ impl App {
         let (list, idx) = match self.active_tab {
             Tab::Library => (&self.tracks, self.library_selected),
             Tab::Search => (&self.search_results, self.search_selected),
+            Tab::Friends => (&self.peer_tracks, self.peer_track_selected),
             Tab::Playlists => (&self.selected_playlist_tracks, self.playlist_track_selected),
             _ => return Ok(()),
         };
@@ -509,7 +726,36 @@ impl App {
             return Ok(());
         };
         let next = self.queue.peek_next_for_prefetch().cloned();
-        if let TrackSource::Torrent { .. } = &track.source {
+
+        // Prefetch next peer track in background if not cached on disk yet
+        if let Some(ref next_track) = next {
+            if matches!(next_track.source, TrackSource::Peer { .. }) {
+                let next_ready = next_track
+                    .source
+                    .playable_path()
+                    .map(|p| Path::new(p).exists())
+                    .unwrap_or(false);
+                if !next_ready {
+                    self.ensure_peer_track_download(next_track, false, false);
+                }
+            }
+        }
+
+        if let TrackSource::Peer { .. } = &track.source {
+            let ready = track
+                .source
+                .playable_path()
+                .map(|p| Path::new(p).exists())
+                .unwrap_or(false);
+            if !ready {
+                self.status_message = format!("⏳ P2P streaming: {}...", track.title);
+                self.ensure_peer_track_download(&track, true, false);
+                return Ok(());
+            }
+            if let Ok(guard) = self.db.lock() {
+                let _ = self.cache.touch(&guard, &track.source.unique_key());
+            }
+        } else if let TrackSource::Torrent { .. } = &track.source {
             if let Ok(guard) = self.db.lock() {
                 let _ = self.cache.touch(&guard, &track.source.unique_key());
             }
@@ -539,12 +785,23 @@ impl App {
 
     pub fn toggle_pin_selected(&mut self) -> Result<()> {
         match self.active_tab {
-            Tab::Library | Tab::Search => {
+            Tab::Library | Tab::Search | Tab::Friends => {
                 if let Some(t) = self.selected_track_in_active_tab() {
                     let next = !t.pinned;
                     {
                         let guard = self.db.lock().expect("db mutex poisoned");
                         self.cache.set_track_pin(&guard, &t, next)?;
+                    }
+                    if next {
+                        if let TrackSource::Peer { cached_path, .. } = &t.source {
+                            let exists = cached_path
+                                .as_deref()
+                                .map(|p| Path::new(p).exists())
+                                .unwrap_or(false);
+                            if !exists {
+                                self.ensure_peer_track_download(&t, false, true);
+                            }
+                        }
                     }
                     self.status_message = self.i18n.pin_toggled(&t.title, next);
                     self.refresh_from_db()?;
@@ -848,5 +1105,251 @@ impl App {
         }
         self.queue.set_queue(audio_files, 0);
         self.play_current_in_queue()
+    }
+
+    pub fn push_p2p_log(&mut self, line: String) {
+        self.p2p_logs.push(line);
+        if self.p2p_logs.len() > 80 {
+            let excess = self.p2p_logs.len() - 80;
+            self.p2p_logs.drain(0..excess);
+        }
+    }
+
+    pub fn local_p2p_ticket(&self) -> PeerTicket {
+        if let Some(srv) = &self.p2p_server {
+            srv.ticket()
+        } else {
+            PeerTicket {
+                node_id: self.node_identity.node_id.clone(),
+                node_name: self.node_identity.node_name.clone(),
+                endpoint: format!(
+                    "{}:{}",
+                    rust_audio_net_friends::detect_lan_ip(),
+                    rust_audio_net_friends::DEFAULT_P2P_PORT
+                ),
+                auth_token: self.node_identity.auth_token.clone(),
+            }
+        }
+    }
+
+    pub fn is_lan_share_enabled(&self) -> bool {
+        self.p2p_server
+            .as_ref()
+            .map(|s| s.is_lan_share_enabled())
+            .unwrap_or(true)
+    }
+
+    pub fn toggle_lan_share(&mut self) {
+        let next = !self.is_lan_share_enabled();
+        if let Some(srv) = &self.p2p_server {
+            if let Ok(guard) = self.db.lock() {
+                srv.set_lan_share_enabled(&guard, next);
+            }
+        }
+        let msg = self.i18n.friends_lan_share_label(next).to_string();
+        self.push_p2p_log(format!("[INFO] {msg}"));
+        self.status_message = msg;
+    }
+
+    pub fn toggle_qr_modal(&mut self) {
+        self.show_qr_modal = !self.show_qr_modal;
+    }
+
+    pub fn connect_peer_input(&mut self) {
+        let raw = self.peer_connect_input.trim().to_string();
+        self.peer_connect_editing = false;
+        if raw.is_empty() {
+            return;
+        }
+        self.push_p2p_log(format!("[INFO] Conectando a nodo '{}'...", raw));
+        self.status_message = format!("⏳ P2P: {raw}...");
+        self.spawn_peer_sync(raw);
+    }
+
+    pub fn trigger_lan_discovery(&mut self) {
+        self.push_p2p_log("[INFO] Buscando nodos rust-audio-p2p en LAN...".to_string());
+        let client = self.p2p_client.clone();
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let found = client.discover_lan_peers(Duration::from_millis(900)).await;
+            let _ = tx.send(AsyncEvent::P2pLanDiscovered(found));
+        });
+    }
+
+    pub fn resync_selected_peer(&mut self) {
+        if let Some(peer) = self.paired_peers.get(self.peer_selected).cloned() {
+            let ticket = PeerTicket {
+                node_id: peer.node_id,
+                node_name: peer.node_name.clone(),
+                endpoint: peer.endpoint,
+                auth_token: peer.auth_token,
+            };
+            self.push_p2p_log(format!("[INFO] Resincronizando '{}'...", peer.node_name));
+            self.spawn_peer_sync(ticket.to_uri());
+        }
+    }
+
+    fn spawn_peer_sync(&self, target: String) {
+        let client = self.p2p_client.clone();
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            match client.resolve_and_sync_peer(&target).await {
+                Ok((peer, catalog)) => {
+                    let _ = tx.send(AsyncEvent::P2pPeerSynced { peer, catalog });
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncEvent::P2pPeerSyncFailed {
+                        target,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn apply_synced_peer(
+        &mut self,
+        peer: PairedPeer,
+        catalog: RemoteCatalogDto,
+    ) -> Result<()> {
+        if let Some(existing) = self
+            .paired_peers
+            .iter_mut()
+            .find(|p| p.node_id == peer.node_id)
+        {
+            *existing = peer.clone();
+        } else {
+            self.paired_peers.push(peer.clone());
+        }
+
+        let track_count = catalog.tracks.len();
+        let playlist_count = catalog.playlists.len();
+
+        {
+            let guard = self.db.lock().expect("db mutex poisoned");
+            guard.save_paired_peers(&self.paired_peers)?;
+
+            let mut remote_to_local: HashMap<i64, i64> = HashMap::new();
+            for rt in &catalog.tracks {
+                let track = Track {
+                    id: 0,
+                    title: rt.title.clone(),
+                    artist: rt.artist.clone(),
+                    album: rt.album.clone(),
+                    year: rt.year,
+                    track_number: rt.track_number,
+                    duration_secs: rt.duration_secs,
+                    file_size_bytes: rt.file_size_bytes,
+                    format: rt.format.clone(),
+                    cover_path: None,
+                    source: TrackSource::Peer {
+                        node_id: catalog.node_id.clone(),
+                        node_name: catalog.node_name.clone(),
+                        remote_track_id: rt.id,
+                        cached_path: None,
+                    },
+                    pinned: false,
+                };
+                if let Ok(local_id) = guard.upsert_track(&track) {
+                    remote_to_local.insert(rt.id, local_id);
+                }
+            }
+
+            for rpl in &catalog.playlists {
+                let pl_name = format!("[P2P: {}] {}", catalog.node_name, rpl.name);
+                if let Ok(local_pl_id) = guard.create_playlist(&pl_name) {
+                    for remote_tid in &rpl.track_ids {
+                        if let Some(&local_tid) = remote_to_local.get(remote_tid) {
+                            let _ = guard.add_track_to_playlist(local_pl_id, local_tid);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.refresh_from_db()?;
+        let ok_msg = format!(
+            "[OK] Nodo '{}' sincronizado: {} pistas, {} playlists",
+            peer.node_name, track_count, playlist_count
+        );
+        self.push_p2p_log(ok_msg.clone());
+        self.status_message = ok_msg;
+        Ok(())
+    }
+
+    pub fn ensure_peer_track_download(
+        &mut self,
+        track: &Track,
+        play_on_ready: bool,
+        pin_on_ready: bool,
+    ) {
+        let TrackSource::Peer {
+            node_id,
+            remote_track_id,
+            ..
+        } = &track.source
+        else {
+            return;
+        };
+
+        let key = track.source.unique_key();
+        if let Some(existing) = self.pending_peer_downloads.get_mut(&key) {
+            existing.play_on_ready |= play_on_ready;
+            existing.pin_on_ready |= pin_on_ready;
+            return;
+        }
+
+        let Some(peer) = self
+            .paired_peers
+            .iter()
+            .find(|p| p.node_id == *node_id)
+            .cloned()
+        else {
+            self.push_p2p_log(format!(
+                "[ERR] Nodo '{node_id}' no encontrado en nodos emparejados"
+            ));
+            return;
+        };
+
+        self.pending_peer_downloads.insert(
+            key.clone(),
+            PeerDownloadIntent {
+                play_on_ready,
+                pin_on_ready,
+            },
+        );
+        self.push_p2p_log(format!(
+            "[INFO] Descargando '{}' desde '{}'...",
+            track.title, peer.node_name
+        ));
+
+        let client = self.p2p_client.clone();
+        let tx = self.async_tx.clone();
+        let cache_dir = self.paths.cache_dir.clone();
+        let track_clone = track.clone();
+        let remote_id = *remote_track_id;
+        tokio::spawn(async move {
+            match client
+                .download_peer_track_to_cache(&peer, remote_id, &track_clone.format, &cache_dir)
+                .await
+            {
+                Ok(path) => {
+                    let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    let _ = tx.send(AsyncEvent::P2pTrackDownloaded {
+                        source_key: key,
+                        track: track_clone,
+                        cached_path: path.to_string_lossy().to_string(),
+                        file_size,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncEvent::P2pTrackDownloadFailed {
+                        source_key: key,
+                        title: track_clone.title,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        });
     }
 }

@@ -21,6 +21,7 @@ use rust_audio_core::{
     detect_system_language, AppPaths, Database, I18n, Language, LanguagePreference,
     DEFAULT_CACHE_LIMIT_BYTES,
 };
+use rust_audio_net_friends::{FriendNodeClient, FriendNodeServer, NodeIdentity};
 use rust_audio_source_local::{default_scan_root, scan_directory_sync};
 use rust_audio_source_torrent::{is_torrent_uri, sanitize_torrent_uri};
 
@@ -157,6 +158,9 @@ async fn main() -> Result<()> {
 
     let res = event_loop(&mut terminal, &mut app).await;
     terminal.show_cursor()?;
+    if let Some(srv) = &app.p2p_server {
+        srv.shutdown();
+    }
     if let Some(engine) = &app.torrent_engine {
         engine.stop().await;
     }
@@ -205,8 +209,19 @@ fn handle_paste(app: &mut App, raw: String) -> Result<()> {
         app.active_tab = Tab::Torrents;
         app.search_editing = false;
         app.playlist_editing = false;
+        app.peer_connect_editing = false;
         app.torrent_input_mode = TorrentInputMode::None;
         app.add_torrent_uri(fixed);
+        return Ok(());
+    }
+
+    if trimmed.to_ascii_lowercase().starts_with("rap2p://") {
+        app.active_tab = Tab::Friends;
+        app.search_editing = false;
+        app.playlist_editing = false;
+        app.torrent_input_mode = TorrentInputMode::None;
+        app.peer_connect_input = trimmed.to_string();
+        app.connect_peer_input();
         return Ok(());
     }
 
@@ -234,6 +249,10 @@ fn handle_paste(app: &mut App, raw: String) -> Result<()> {
                 app.torrent_query.push_str(trimmed);
             }
         },
+        Tab::Friends => {
+            app.peer_connect_editing = true;
+            app.peer_connect_input.push_str(trimmed);
+        }
         _ => {}
     }
     Ok(())
@@ -311,6 +330,11 @@ fn handle_mouse(
                 }
             }
         }
+        return Ok(());
+    }
+
+    if app.show_qr_modal {
+        app.show_qr_modal = false;
         return Ok(());
     }
 
@@ -440,6 +464,42 @@ fn handle_mouse(
             }
         }
         Tab::CacheSettings => {}
+        Tab::Friends => {
+            if point_in(layout.peer_discover_btn, col, row) {
+                app.peer_connect_editing = false;
+                app.trigger_lan_discovery();
+            } else if point_in(layout.peer_lan_share_btn, col, row) {
+                app.peer_connect_editing = false;
+                app.toggle_lan_share();
+            } else if point_in(layout.peer_qr_btn, col, row) {
+                app.peer_connect_editing = false;
+                app.toggle_qr_modal();
+            } else if point_in(layout.peer_connect_input, col, row) {
+                app.peer_connect_editing = true;
+            } else if point_in(layout.peer_list, col, row) && row >= layout.peer_list.y + 1 {
+                app.peer_connect_editing = false;
+                let idx = layout.peer_list_scroll + (row - (layout.peer_list.y + 1)) as usize;
+                if idx < app.paired_peers.len() {
+                    app.peer_selected = idx;
+                    if is_double_click {
+                        app.resync_selected_peer();
+                    }
+                }
+            } else if point_in(layout.peer_tracks_table, col, row)
+                && row >= layout.peer_tracks_table.y + 2
+            {
+                app.peer_connect_editing = false;
+                let idx =
+                    layout.peer_tracks_scroll + (row - (layout.peer_tracks_table.y + 2)) as usize;
+                if idx < app.peer_tracks.len() {
+                    let already = app.peer_track_selected == idx;
+                    app.peer_track_selected = idx;
+                    if is_double_click || already {
+                        app.play_selected_from_active_list()?;
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -467,7 +527,11 @@ fn handle_tab_hotkeys(app: &mut App, key: &KeyEvent) -> bool {
             app.switch_tab(Tab::CacheSettings);
             true
         }
-        KeyCode::Char(c @ '1'..='5') if key.modifiers.contains(KeyModifiers::ALT) => {
+        KeyCode::F(6) => {
+            app.switch_tab(Tab::Friends);
+            true
+        }
+        KeyCode::Char(c @ '1'..='6') if key.modifiers.contains(KeyModifiers::ALT) => {
             let idx = (c as u8 - b'1') as usize;
             app.switch_tab(Tab::all()[idx]);
             true
@@ -525,8 +589,18 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
-    // Always allow F1..F5 or Alt+1..5 even while typing in inputs
+    // Always allow F1..F6 or Alt+1..6 even while typing in inputs
     if handle_tab_hotkeys(app, &key) {
+        return Ok(());
+    }
+
+    if app.show_qr_modal {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('v') | KeyCode::Enter | KeyCode::Char('q') => {
+                app.show_qr_modal = false;
+            }
+            _ => {}
+        }
         return Ok(());
     }
 
@@ -619,6 +693,20 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
+    // 4b. P2P Connect input editing
+    if app.peer_connect_editing && app.active_tab == Tab::Friends {
+        match key.code {
+            KeyCode::Esc => app.peer_connect_editing = false,
+            KeyCode::Enter => app.connect_peer_input(),
+            KeyCode::Backspace => {
+                app.peer_connect_input.pop();
+            }
+            KeyCode::Char(c) => app.peer_connect_input.push(c),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // 5. Global navigation and playback shortcuts
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
@@ -627,9 +715,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('3') => app.switch_tab(Tab::Playlists),
         KeyCode::Char('4') => app.switch_tab(Tab::Torrents),
         KeyCode::Char('5') => app.switch_tab(Tab::CacheSettings),
+        KeyCode::Char('6') => app.switch_tab(Tab::Friends),
         KeyCode::Char('/') | KeyCode::Char('i') => match app.active_tab {
             Tab::Playlists => app.playlist_editing = true,
             Tab::Torrents => app.torrent_input_mode = TorrentInputMode::Search,
+            Tab::Friends => app.peer_connect_editing = true,
             _ => app.switch_tab(Tab::Search),
         },
         KeyCode::Tab if app.active_tab == Tab::Playlists => {
@@ -663,24 +753,29 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('d') | KeyCode::Delete if app.active_tab == Tab::Playlists => {
             app.remove_selected_from_playlist()?;
         }
+        KeyCode::Char('d') if app.active_tab == Tab::Friends => app.trigger_lan_discovery(),
         KeyCode::Char('r') => app.trigger_rescan(),
         KeyCode::Char('l') => app.cycle_language(),
         KeyCode::Char('c') if app.active_tab == Tab::CacheSettings => app.purge_cache()?,
+        KeyCode::Char('c') if app.active_tab == Tab::Friends => app.peer_connect_editing = true,
         KeyCode::Char('[') if app.active_tab == Tab::CacheSettings => app.adjust_cache_limit_mb(-512)?,
         KeyCode::Char(']') if app.active_tab == Tab::CacheSettings => app.adjust_cache_limit_mb(512)?,
         KeyCode::Char('s') if app.active_tab == Tab::Torrents => {
             app.torrent_input_mode = TorrentInputMode::Search;
         }
+        KeyCode::Char('s') if app.active_tab == Tab::Friends => app.toggle_lan_share(),
+        KeyCode::Char('v') if app.active_tab == Tab::Friends => app.toggle_qr_modal(),
         KeyCode::Char('m') if app.active_tab == Tab::Torrents => {
             app.torrent_input_mode = TorrentInputMode::Magnet;
         }
         KeyCode::Char('u') if app.active_tab == Tab::Torrents => {
             app.torrent_input_mode = TorrentInputMode::JackettUrl;
         }
+        KeyCode::Char('u') if app.active_tab == Tab::Friends => app.resync_selected_peer(),
         KeyCode::Up | KeyCode::Char('k') => move_selection(app, -1)?,
         KeyCode::Down | KeyCode::Char('j') => move_selection(app, 1)?,
         KeyCode::Enter => match app.active_tab {
-            Tab::Library | Tab::Search => app.play_selected_from_active_list()?,
+            Tab::Library | Tab::Search | Tab::Friends => app.play_selected_from_active_list()?,
             Tab::Torrents => {
                 if let Some(res) = app.torrent_results.get(app.torrent_result_selected) {
                     app.torrent_magnet_input = res.magnet_uri.clone();
@@ -747,6 +842,13 @@ fn move_selection(app: &mut App, delta: isize) -> Result<()> {
             }
         }
         Tab::CacheSettings => {}
+        Tab::Friends => {
+            let len = app.peer_tracks.len();
+            if len > 0 {
+                app.peer_track_selected =
+                    (app.peer_track_selected as isize + delta).clamp(0, len as isize - 1) as usize;
+            }
+        }
     }
     Ok(())
 }
@@ -790,7 +892,7 @@ async fn run_self_test(scan_override: Option<PathBuf>) -> Result<()> {
         false,
     )?;
 
-    println!("[1/7] i18n detected language: {} ({}) | auto_next={}", app.i18n.lang.display_name(), app.i18n.lang.code(), app.auto_next);
+    println!("[1/8] i18n detected language: {} ({}) | auto_next={}", app.i18n.lang.display_name(), app.i18n.lang.code(), app.auto_next);
     assert_eq!(app.cache.limit_bytes, DEFAULT_CACHE_LIMIT_BYTES);
     assert!(app.auto_next);
 
@@ -801,7 +903,7 @@ async fn run_self_test(scan_override: Option<PathBuf>) -> Result<()> {
     let indexed_second = scan_directory_sync(&scan_root, &app.db, Some(&app.scan_tx))?;
     let second_ms = t1.elapsed().as_millis();
     app.refresh_from_db()?;
-    println!("[2/7] Scan ({}): 1st={} tracks in {}ms | 2nd incremental={} tracks in {}ms", scan_root.display(), indexed, first_ms, indexed_second, second_ms);
+    println!("[2/8] Scan ({}): 1st={} tracks in {}ms | 2nd incremental={} tracks in {}ms", scan_root.display(), indexed, first_ms, indexed_second, second_ms);
     assert!(!app.tracks.is_empty());
     assert_eq!(indexed, indexed_second);
 
@@ -809,7 +911,7 @@ async fn run_self_test(scan_override: Option<PathBuf>) -> Result<()> {
     assert!(app.search_editing, "Switching to Search tab must activate typing immediately");
     app.search_query = app.tracks[0].artist.split_whitespace().next().unwrap_or("").to_string();
     app.refresh_from_db()?;
-    println!("[3/7] FTS5 live search for '{}' returned {} matches", app.search_query, app.search_results.len());
+    println!("[3/8] FTS5 live search for '{}' returned {} matches", app.search_query, app.search_results.len());
     assert!(!app.search_results.is_empty());
 
     app.switch_tab(Tab::Library);
@@ -821,7 +923,7 @@ async fn run_self_test(scan_override: Option<PathBuf>) -> Result<()> {
     }
     app.confirm_playlist_picker()?;
     app.toggle_pin_selected()?;
-    println!("[4/7] Added track via PlaylistPicker modal (playlist tracks={}, pinned={})", app.selected_playlist_tracks.len(), app.pinned_tracks.len());
+    println!("[4/8] Added track via PlaylistPicker modal (playlist tracks={}, pinned={})", app.selected_playlist_tracks.len(), app.pinned_tracks.len());
     assert_eq!(app.selected_playlist_tracks.len(), 1);
     assert!(!app.pinned_tracks.is_empty());
 
@@ -837,7 +939,7 @@ async fn run_self_test(scan_override: Option<PathBuf>) -> Result<()> {
     }
     app.torrent_searching = false;
     println!(
-        "[5/7] TorrentSearchProvider ({}) returned {} result(s) (logs: {}, warnings: {})",
+        "[5/8] TorrentSearchProvider ({}) returned {} result(s) (logs: {}, warnings: {})",
         app.search_provider.provider_names().join(", "),
         torrent_res.len(),
         app.torrent_search_logs.len(),
@@ -856,14 +958,62 @@ async fn run_self_test(scan_override: Option<PathBuf>) -> Result<()> {
     std::thread::sleep(Duration::from_millis(40));
     let pst = app.player.status();
     println!(
-        "[6/7] Player state={:?}, pos={:.1}s, prefetch={:?} ({} bytes)",
+        "[6/8] Player state={:?}, pos={:.1}s, prefetch={:?} ({} bytes)",
         pst.state,
         pst.position_secs,
         pst.prefetch_track.as_ref().map(|t| t.title.as_str()),
         pst.prefetched_bytes
     );
 
-    // Render splash screen, all 5 tabs, and playlist picker modal in Spanish and English
+    // [7/8] P2P node server + catalog sync + audio streaming to local cache
+    let peer_audio = temp_base.join("peer_shared.wav");
+    std::fs::write(&peer_audio, b"RIFF....WAVEfmt_peer_audio")?;
+    let peer_db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory()?));
+    let peer_id = NodeIdentity::load_or_create(&peer_db.lock().unwrap())?;
+    {
+        let g = peer_db.lock().unwrap();
+        let tid = g.upsert_track(&rust_audio_core::Track {
+            id: 0,
+            title: "Remote P2P Song".to_string(),
+            artist: "Peer Artist".to_string(),
+            album: "Shared Album".to_string(),
+            year: Some(2025),
+            track_number: Some(1),
+            duration_secs: Some(90),
+            file_size_bytes: 26,
+            format: "wav".to_string(),
+            cover_path: None,
+            source: rust_audio_core::TrackSource::LocalFile {
+                path: peer_audio.to_string_lossy().to_string(),
+            },
+            pinned: false,
+        })?;
+        let pid = g.create_playlist("Shared Mix")?;
+        g.add_track_to_playlist(pid, tid)?;
+    }
+    let srv = FriendNodeServer::start_with_options(peer_db, peer_id, Some(0), None).await?;
+    let client = FriendNodeClient::new();
+    let (paired_peer, catalog) = client.resolve_and_sync_peer(&srv.ticket().to_uri()).await?;
+    app.apply_synced_peer(paired_peer.clone(), catalog.clone())?;
+    let cached_peer_file = client
+        .download_peer_track_to_cache(
+            &paired_peer,
+            catalog.tracks[0].id,
+            &catalog.tracks[0].format,
+            &app.paths.cache_dir,
+        )
+        .await?;
+    assert!(cached_peer_file.exists());
+    assert!(!app.peer_tracks.is_empty());
+    srv.shutdown();
+    println!(
+        "[7/8] P2P sync & audio stream verified (peers={}, remote_tracks={}, cached={})",
+        app.paired_peers.len(),
+        app.peer_tracks.len(),
+        cached_peer_file.display()
+    );
+
+    // Render splash screen, all 6 tabs, playlist picker modal, and QR modal in Spanish and English
     let mut terminal = Terminal::new(TestBackend::new(120, 35))?;
     terminal.draw(|f| ui::draw_loading_screen(f, &app.i18n))?;
     for pref in [LanguagePreference::Es, LanguagePreference::En] {
@@ -872,12 +1022,17 @@ async fn run_self_test(scan_override: Option<PathBuf>) -> Result<()> {
             app.switch_tab(tab);
             terminal.draw(|f| ui::draw(f, &app))?;
         }
+        app.switch_tab(Tab::Friends);
+        app.toggle_qr_modal();
+        terminal.draw(|f| ui::draw(f, &app))?;
+        app.show_qr_modal = false;
+
         app.switch_tab(Tab::Library);
         app.open_playlist_picker_for_selected();
         terminal.draw(|f| ui::draw(f, &app))?;
         app.playlist_picker = None;
     }
-    println!("[7/7] Rendered splash screen, all 5 TUI tabs, and PlaylistPicker modal in Es & En cleanly.");
+    println!("[8/8] Rendered splash screen, all 6 TUI tabs, QR modal, and PlaylistPicker modal in Es & En cleanly.");
 
     let _ = std::fs::remove_dir_all(&temp_base);
     Ok(())
@@ -1023,6 +1178,23 @@ mod tests {
         assert!(app.torrent_search_logs.iter().any(|l| l.contains("Spinetta Test")));
 
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &app)).unwrap();
+
+        let _ = std::fs::remove_dir_all(&temp_base);
+    }
+
+    #[tokio::test]
+    async fn test_paste_rap2p_ticket_and_friends_tab() {
+        let (mut app, temp_base) = make_test_app();
+        handle_paste(&mut app, "rap2p://127.0.0.1:4261#deadbeef?name=air".to_string()).unwrap();
+        assert_eq!(app.active_tab, Tab::Friends);
+        assert!(app.peer_connect_input.starts_with("rap2p://127.0.0.1:4261"));
+        assert!(app.p2p_logs.iter().any(|l| l.contains("Conectando a nodo")));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &app)).unwrap();
+        app.toggle_qr_modal();
+        assert!(app.show_qr_modal);
         terminal.draw(|f| ui::draw(f, &app)).unwrap();
 
         let _ = std::fs::remove_dir_all(&temp_base);

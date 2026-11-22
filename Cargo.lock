@@ -2764,7 +2764,12 @@ dependencies = [
 name = "rust-audio-net-friends"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "reqwest",
  "rust-audio-core",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2814,6 +2819,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "rust-audio-core",
+ "rust-audio-net-friends",
  "rust-audio-player",
  "rust-audio-source-local",
  "rust-audio-source-torrent",

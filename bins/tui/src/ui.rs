@@ -3,7 +3,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
-use rust_audio_core::{I18n, ScanStatus};
+use rust_audio_core::{I18n, ScanStatus, TrackSource};
 use rust_audio_player::{AudioBackendKind, PlaybackState};
 use rust_audio_source_torrent::redact_url_secrets;
 
@@ -108,6 +108,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Tab::Playlists => draw_playlists(frame, app, root[3]),
         Tab::Torrents => draw_torrents(frame, app, root[3]),
         Tab::CacheSettings => draw_cache_settings(frame, app, root[3]),
+        Tab::Friends => draw_friends(frame, app, root[3]),
     }
 
     draw_player_bar(frame, app, root[4]);
@@ -115,6 +116,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     if app.playlist_picker.is_some() {
         draw_playlist_picker_modal(frame, app);
+    } else if app.show_qr_modal {
+        draw_qr_modal(frame, app);
     }
 }
 
@@ -184,6 +187,7 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
         app.i18n.tab_playlists(),
         app.i18n.tab_torrents(),
         app.i18n.tab_cache_settings(),
+        app.i18n.tab_friends(),
     ];
     let titles: Vec<Line> = raw_titles.iter().map(|t| Line::from(*t)).collect();
     let idx = Tab::all()
@@ -245,6 +249,20 @@ fn draw_track_table(
         .take(height.max(1))
         .map(|(i, t)| {
             let pin_mark = if t.pinned { "★" } else { " " };
+            let fmt_cell = match &t.source {
+                TrackSource::Peer { cached_path, .. } => {
+                    let cached = cached_path
+                        .as_deref()
+                        .map(|p| std::path::Path::new(p).exists())
+                        .unwrap_or(false);
+                    if cached {
+                        format!("{}✓", t.format.to_uppercase())
+                    } else {
+                        format!("{}☁", t.format.to_uppercase())
+                    }
+                }
+                _ => t.format.to_uppercase(),
+            };
             let style = if i == selected && focused {
                 Style::default()
                     .bg(Color::DarkGray)
@@ -260,7 +278,7 @@ fn draw_track_table(
                 Cell::from(t.title.clone()),
                 Cell::from(t.artist.clone()),
                 Cell::from(t.album.clone()),
-                Cell::from(t.format.to_uppercase()),
+                Cell::from(fmt_cell),
             ])
             .style(style)
         });
@@ -833,4 +851,256 @@ fn draw_playlist_picker_modal(frame: &mut Frame, app: &App) {
     let mut l = app.layout.borrow_mut();
     l.modal_box = modal_area;
     l.modal_list = inner[1];
+}
+
+fn draw_friends(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Local node + action buttons
+            Constraint::Length(3), // Connect input
+            Constraint::Min(6),    // Peers/Log + Remote tracks
+        ])
+        .split(area);
+
+    let lan_enabled = app.is_lan_share_enabled();
+    let lan_lbl = app.i18n.friends_lan_share_label(lan_enabled);
+    let lan_w = lan_lbl.chars().count() as u16 + 4;
+    let top_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(20),
+            Constraint::Length(20),
+            Constraint::Length(lan_w.max(24)),
+            Constraint::Length(14),
+        ])
+        .split(rows[0]);
+
+    let ticket = app.local_p2p_ticket();
+    let ticket_uri = ticket.to_uri();
+    let local_box = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!("{} | ", ticket.node_name),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(ticket_uri, Style::default().fg(Color::Cyan)),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", app.i18n.friends_local_header())),
+    );
+    frame.render_widget(local_box, top_cols[0]);
+
+    let discover_btn = Paragraph::new(app.i18n.friends_scan_btn())
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(discover_btn, top_cols[1]);
+
+    let lan_btn = Paragraph::new(lan_lbl)
+        .alignment(Alignment::Center)
+        .style(
+            Style::default()
+                .fg(if lan_enabled { Color::Green } else { Color::Yellow })
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(lan_btn, top_cols[2]);
+
+    let qr_btn = Paragraph::new("[v] QR")
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(qr_btn, top_cols[3]);
+
+    let cursor = if app.peer_connect_editing { "█" } else { "" };
+    let connect_border = if app.peer_connect_editing {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let connect_box = Paragraph::new(format!(
+        "{}{}{}",
+        app.i18n.friends_connect_prompt(),
+        app.peer_connect_input,
+        cursor
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(connect_border)
+            .title(format!(" {} ", app.i18n.friends_actions_hint())),
+    );
+    frame.render_widget(connect_box, rows[1]);
+
+    let body_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(rows[2]);
+
+    let left_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(body_cols[0]);
+
+    let peers_h = left_rows[0].height.saturating_sub(2) as usize;
+    let peers_scroll = if peers_h > 0 && app.peer_selected >= peers_h {
+        app.peer_selected - peers_h + 1
+    } else {
+        0
+    };
+    let peer_lines: Vec<Line> = if app.paired_peers.is_empty() {
+        vec![Line::styled(
+            app.i18n.friends_no_peers_hint(),
+            Style::default().fg(Color::Gray),
+        )]
+    } else {
+        app.paired_peers
+            .iter()
+            .enumerate()
+            .skip(peers_scroll)
+            .take(peers_h.max(1))
+            .map(|(i, p)| {
+                let st = if i == app.peer_selected {
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                Line::styled(
+                    format!(
+                        "● {} ({}) | {} trk / {} pl",
+                        p.node_name, p.endpoint, p.track_count, p.playlist_count
+                    ),
+                    st,
+                )
+            })
+            .collect()
+    };
+    let peers_widget = Paragraph::new(peer_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(
+                " {} ({}) [DblClic/u: Sync] ",
+                app.i18n.friends_peers_header(),
+                app.paired_peers.len()
+            )),
+    );
+    frame.render_widget(peers_widget, left_rows[0]);
+
+    let log_cap = left_rows[1].height.saturating_sub(2) as usize;
+    let log_skip = app.p2p_logs.len().saturating_sub(log_cap.max(1));
+    let log_lines: Vec<Line> = app
+        .p2p_logs
+        .iter()
+        .skip(log_skip)
+        .map(|entry| {
+            let st = if entry.starts_with("[OK]") {
+                Style::default().fg(Color::Green)
+            } else if entry.starts_with("[ERR]") {
+                Style::default().fg(Color::Red)
+            } else if entry.starts_with("[LAN]") {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            Line::styled(entry.as_str(), st)
+        })
+        .collect();
+    let logs_widget = Paragraph::new(log_lines)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ({}) ", app.i18n.friends_log_header(), app.p2p_logs.len())),
+        );
+    frame.render_widget(logs_widget, left_rows[1]);
+
+    let tracks_scroll = draw_track_table(
+        frame,
+        app,
+        &app.peer_tracks,
+        app.peer_track_selected,
+        &format!(
+            "{} ({})",
+            app.i18n.friends_tracks_header(),
+            app.i18n.friends_catalog_suffix()
+        ),
+        body_cols[1],
+        true,
+    );
+
+    let mut l = app.layout.borrow_mut();
+    l.peer_discover_btn = top_cols[1];
+    l.peer_lan_share_btn = top_cols[2];
+    l.peer_qr_btn = top_cols[3];
+    l.peer_connect_input = rows[1];
+    l.peer_list = left_rows[0];
+    l.peer_list_scroll = peers_scroll;
+    l.peer_tracks_table = body_cols[1];
+    l.peer_tracks_scroll = tracks_scroll;
+}
+
+fn draw_qr_modal(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(12),
+            Constraint::Percentage(76),
+            Constraint::Percentage(12),
+        ])
+        .split(area);
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Percentage(70),
+            Constraint::Percentage(15),
+        ])
+        .split(v[1]);
+    let modal_area = h[1];
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .title(format!(" {} ", app.i18n.friends_qr_title()));
+    frame.render_widget(block, modal_area);
+
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(14), Constraint::Length(4)])
+        .margin(1)
+        .split(modal_area);
+
+    let ticket = app.local_p2p_ticket();
+    let qr_lines: Vec<Line> = ticket
+        .render_unicode_qr()
+        .into_iter()
+        .map(|row| Line::styled(row, Style::default().fg(Color::White).bg(Color::Black)))
+        .collect();
+    frame.render_widget(Paragraph::new(qr_lines).alignment(Alignment::Center), inner[0]);
+
+    let info_lines = vec![
+        Line::styled(
+            format!("Token: {}", ticket.to_uri()),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            format!("IP/Puerto LAN: {}", ticket.endpoint),
+            Style::default().fg(Color::Green),
+        ),
+    ];
+    frame.render_widget(
+        Paragraph::new(info_lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
+        inner[1],
+    );
+
+    app.layout.borrow_mut().qr_modal_box = modal_area;
 }

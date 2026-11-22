@@ -69,6 +69,20 @@ impl PlaybackQueue {
         self.items.get(idx + 1)
     }
 
+    pub fn update_track_cached_path(&mut self, source_key: &str, cached_path: &str) {
+        for item in &mut self.items {
+            if item.source.unique_key() == source_key {
+                if let crate::models::TrackSource::Peer {
+                    cached_path: ref mut cp,
+                    ..
+                } = item.source
+                {
+                    *cp = Some(cached_path.to_string());
+                }
+            }
+        }
+    }
+
     pub fn items(&self) -> &[Track] {
         &self.items
     }

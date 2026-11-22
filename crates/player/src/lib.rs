@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rodio::{Decoder, OutputStream, Sink, Source};
-use rust_audio_core::{Track, TrackSource};
+use rust_audio_core::Track;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioBackendKind {
@@ -477,15 +477,9 @@ fn prefetch_next_bytes(next: Option<&Track>) -> usize {
     let Some(track) = next else {
         return 0;
     };
-    match &track.source {
-        TrackSource::LocalFile { path } => read_head_buffer(Path::new(path), 256 * 1024),
-        TrackSource::Torrent {
-            cached_path: Some(path),
-            ..
-        } => read_head_buffer(Path::new(path), 256 * 1024),
-        TrackSource::Torrent {
-            cached_path: None, ..
-        } => 0,
+    match track.source.playable_path() {
+        Some(path) => read_head_buffer(Path::new(path), 256 * 1024),
+        None => 0,
     }
 }
 
@@ -507,6 +501,7 @@ fn read_head_buffer(path: &Path, max_bytes: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_audio_core::TrackSource;
 
     #[test]
     fn test_headless_player_play_seek_pause_and_prefetch() {

@@ -86,25 +86,39 @@ impl LruCacheManager {
         self.enforce_limit(db)
     }
 
+    fn sync_offline_pin_hardlink(&self, track_id: i64, src: &Path, prefix: &str, pinned: bool) {
+        if let Some(name) = src.file_name() {
+            let _ = std::fs::create_dir_all(&self.offline_pins_dir);
+            let link_path = self
+                .offline_pins_dir
+                .join(format!("{prefix}{}_{}", track_id, name.to_string_lossy()));
+            if pinned {
+                if src.exists() && !link_path.exists() {
+                    // Hardlink uses zero extra disk space on the same LV/filesystem.
+                    let _ = std::fs::hard_link(src, &link_path);
+                }
+            } else if link_path.exists() {
+                let _ = std::fs::remove_file(&link_path);
+            }
+        }
+    }
+
     /// Pins or unpins a track for offline travel.
     /// Local files are never duplicated into the LRU download cache; we protect their DB entry
     /// and optionally create a zero-copy hardlink in `offline_pins_dir` if on the same filesystem.
     pub fn set_track_pin(&self, db: &Database, track: &Track, pinned: bool) -> Result<()> {
         db.set_track_pin(track.id, pinned)?;
-        if let TrackSource::LocalFile { path } = &track.source {
-            let src = Path::new(path);
-            if let Some(name) = src.file_name() {
-                let _ = std::fs::create_dir_all(&self.offline_pins_dir);
-                let link_path = self.offline_pins_dir.join(format!("{}_{}", track.id, name.to_string_lossy()));
-                if pinned {
-                    if src.exists() && !link_path.exists() {
-                        // Hardlink uses zero extra disk space on the same LV/filesystem.
-                        let _ = std::fs::hard_link(src, &link_path);
-                    }
-                } else if link_path.exists() {
-                    let _ = std::fs::remove_file(&link_path);
-                }
+        match &track.source {
+            TrackSource::LocalFile { path } => {
+                self.sync_offline_pin_hardlink(track.id, Path::new(path), "", pinned);
             }
+            TrackSource::Peer {
+                cached_path: Some(path),
+                ..
+            } => {
+                self.sync_offline_pin_hardlink(track.id, Path::new(path), "peer_", pinned);
+            }
+            _ => {}
         }
         Ok(())
     }

@@ -145,6 +145,10 @@ impl I18n {
         self.t("5: Caché LRU & Ajustes", "5: LRU Cache & Settings")
     }
 
+    pub fn tab_friends(&self) -> &'static str {
+        self.t("6: Red P2P / Nodos", "6: P2P Net / Nodes")
+    }
+
     pub fn col_title(&self) -> &'static str {
         self.t("Título", "Title")
     }
@@ -336,6 +340,64 @@ impl I18n {
         self.t("Estado de Caché LRU y Preferencias", "LRU Cache Status & Preferences")
     }
 
+    pub fn friends_local_header(&self) -> &'static str {
+        self.t("Este Nodo P2P (Compartir Audio en Red / LAN)", "This P2P Node (Share Audio over Network / LAN)")
+    }
+
+    pub fn friends_connect_prompt(&self) -> &'static str {
+        self.t(
+            "[c] Conectar Nodo (Token rap2p:// o IP:Puerto): ",
+            "[c] Connect Node (rap2p:// Token or IP:Port): ",
+        )
+    }
+
+    pub fn friends_lan_share_label(&self, enabled: bool) -> &'static str {
+        match (self.lang, enabled) {
+            (Language::Es, true) => "Compartir en LAN [s]: ON",
+            (Language::Es, false) => "Compartir en LAN [s]: OFF (Solo con Token)",
+            (Language::En, true) => "LAN Share [s]: ON",
+            (Language::En, false) => "LAN Share [s]: OFF (Token Only)",
+        }
+    }
+
+    pub fn friends_actions_hint(&self) -> &'static str {
+        self.t(
+            "[c] Conectar | [d] Descubrir LAN | [s] LAN On/Off | [v] Ver QR | [Enter/DblClic] Reproducir/Cachear | [p] Pin | [a] +Playlist",
+            "[c] Connect | [d] Discover LAN | [s] LAN On/Off | [v] Show QR | [Enter/DblClick] Play/Cache | [p] Pin | [a] +Playlist",
+        )
+    }
+
+    pub fn friends_peers_header(&self) -> &'static str {
+        self.t("Nodos Emparejados", "Paired Nodes")
+    }
+
+    pub fn friends_tracks_header(&self) -> &'static str {
+        self.t("Catálogo Remoto P2P", "Remote P2P Catalog")
+    }
+
+    pub fn friends_log_header(&self) -> &'static str {
+        self.t("Actividad P2P en Vivo", "Live P2P Activity")
+    }
+
+    pub fn friends_qr_title(&self) -> &'static str {
+        self.t("Token / QR de Emparejamiento P2P (Esc: Cerrar)", "P2P Pairing Token / QR (Esc: Close)")
+    }
+
+    pub fn friends_scan_btn(&self) -> &'static str {
+        self.t("[d] Buscar LAN", "[d] Scan LAN")
+    }
+
+    pub fn friends_no_peers_hint(&self) -> &'static str {
+        self.t(
+            "  (Sin nodos — usá [d] LAN o pegá token rap2p:// / IP)",
+            "  (No peers — press [d] LAN or paste rap2p:// token / IP)",
+        )
+    }
+
+    pub fn friends_catalog_suffix(&self) -> &'static str {
+        self.t("☁=Stream/Cache | ✓=Cacheado", "☁=Stream/Cache | ✓=Cached")
+    }
+
     pub fn language_label(&self) -> String {
         let mode = match self.pref {
             LanguagePreference::Auto => self.t("Auto", "Auto"),
@@ -350,8 +412,8 @@ impl I18n {
 
     pub fn help_footer(&self) -> &'static str {
         self.t(
-            "1-5/Clic: Pestañas | Enter/DobleClic: Reproducir | Space: Pausa | ←/→: Seek ±10s | +/-: Vol | n/b: Sig/Ant | A: Auto-Sig | a: +Playlist | p: Pin | r: Re-escanear | /: Buscar | l: Idioma | q: Salir",
-            "1-5/Click: Tabs | Enter/DblClick: Play | Space: Pause | ←/→: Seek ±10s | +/-: Vol | n/b: Next/Prev | A: Auto-Next | a: +Playlist | p: Pin | r: Rescan | /: Search | l: Lang | q: Quit",
+            "1-6/Clic: Pestañas | Enter/DblClic: Reproducir | Space: Pausa | ←/→: Seek ±10s | +/-: Vol | n/b: Sig/Ant | A: Auto-Sig | a: +Playlist | p: Pin | r: Re-escanear | /: Buscar | l: Idioma | q: Salir",
+            "1-6/Click: Tabs | Enter/DblClick: Play | Space: Pause | ←/→: Seek ±10s | +/-: Vol | n/b: Next/Prev | A: Auto-Next | a: +Playlist | p: Pin | r: Rescan | /: Search | l: Lang | q: Quit",
         )
     }
 
