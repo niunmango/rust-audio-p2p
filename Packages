@@ -1,0 +1,19 @@
+Package: rust-audio-p2p
+Version: 0.1.1
+Architecture: amd64
+Maintainer: niunmango <niunmango@yahoo.com>
+Installed-Size: 15688
+Depends: libc6, libasound2t64 | libasound2
+Filename: ./rust-audio-p2p_0.1.1_amd64.deb
+Size: 5125462
+MD5sum: e83cb5d000bfee102ba27637a040e388
+SHA1: af1c802edca371680040e4bdca12f966563ae25d
+SHA256: 187ca924a66ba3d9fa7e8500cd69eb73923dbd7c9c315b9c3abd92b540758019
+Section: sound
+Priority: optional
+Homepage: https://github.com/niunmango/rust-audio-p2p
+Description: Distributed Audio Player & P2P Network in Rust (TUI)
+ Unified audio player supporting automatic $HOME music discovery,
+ SQLite FTS5 indexing, BitTorrent streaming (librqbit), LRU cache,
+ offline travel pins, and bilingual ES/EN interface.
+

@@ -1,0 +1,23 @@
+Architectures: amd64
+Codename: ./
+Components: main
+Date: Sun, 22 Nov 2026 20:43:19 +0000
+Label: rust-audio-p2p
+Origin: niunmango
+Suite: stable
+MD5Sum:
+ ecae8e57116c6e4800a952b69df40b69              727 Packages
+ 62f4c808e0356d12bc65bd7955a73d66              533 Packages.gz
+ a38a0a084228086174547aa3822ac0d7              143 Release
+SHA1:
+ 7f2964ee993a4e272ecb82f19f4b5c75159e1ddf              727 Packages
+ e18d0d6a39239a87b475e444d751c6858e91f7ab              533 Packages.gz
+ 5187797381e42b70b5823cee26464c36adc62087              143 Release
+SHA256:
+ 045e8b8bccb57c695d24662e02b5fc4aa7719ca53d6677300f56351cba8ff27c              727 Packages
+ e119d7ae9abb4b6ec0f2d050a45ea6c7f7275b8bbc2f9883950b54705ba3f605              533 Packages.gz
+ ea58a1f937baff30f3c42a01d00cd719dabb8ea5e8d39622a9aabf70390c0c92              143 Release
+SHA512:
+ b73bce26abc4a2e791dc28256640791fd46a6af98471471fd53fd0221845dfb5efc1f1d7fb92e69f42d547bb26afc965c058b7250184dbb7d5e0862aed4d422a              727 Packages
+ 2a601282f25b5299a22a5e33a225951adf32af273d5cbb9d733ce8f373412af907058687dc105d88ab53e2fa4beeed201d0f508dc5cba01e4ac056d57a1b84a9              533 Packages.gz
+ beb35ba2c2e3f7987bf98d791b3ce7d95fceae97faf2cefb8a632c77b9d6b31b9fad97f6d596f0fa196460ca47350ff4a401b4dc3d9a2c831358e9672f77948b              143 Release
