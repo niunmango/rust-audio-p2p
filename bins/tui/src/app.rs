@@ -13,7 +13,7 @@ use rust_audio_core::{
 use rust_audio_player::PlayerEngine;
 use rust_audio_source_local::{extract_track_metadata, is_supported_audio, spawn_home_scan, RecommendedWatcher};
 use rust_audio_source_torrent::{
-    extract_magnet_display_name, sanitize_torrent_uri, CompositeSearchProvider,
+    extract_magnet_display_name, redact_url_secrets, sanitize_torrent_uri, CompositeSearchProvider,
     SearchProgressEvent, TorrentEngine, TorrentSearchResult, TorrentStatusSnapshot,
 };
 use tokio::sync::{mpsc, watch};
@@ -346,7 +346,10 @@ impl App {
                         let eng = Arc::clone(&engine);
                         let u_clone = uri.clone();
                         tokio::spawn(async move {
-                            let res = eng.add_magnet(&u_clone).await.map_err(|e| e.to_string());
+                            let res = eng
+                                .add_magnet(&u_clone)
+                                .await
+                                .map_err(|e| redact_url_secrets(&format!("{e:#}")));
                             let _ = tx.send(AsyncEvent::TorrentAdded {
                                 uri: u_clone,
                                 result: res,
@@ -355,13 +358,14 @@ impl App {
                     }
                 }
                 AsyncEvent::TorrentEngineError(err) => {
+                    let safe_err = redact_url_secrets(&err);
                     self.pending_magnets.clear();
                     self.torrent_search_logs
-                        .push(format!("[ERR] Motor BitTorrent: {err}"));
-                    self.status_message = format!("Torrent init: {err}");
+                        .push(format!("[ERR] Motor BitTorrent: {safe_err}"));
+                    self.status_message = format!("Torrent init: {safe_err}");
                 }
                 AsyncEvent::TorrentSearchLog(line) => {
-                    self.torrent_search_logs.push(line);
+                    self.torrent_search_logs.push(redact_url_secrets(&line));
                     if self.torrent_search_logs.len() > 80 {
                         let excess = self.torrent_search_logs.len() - 80;
                         self.torrent_search_logs.drain(0..excess);
@@ -379,7 +383,7 @@ impl App {
                         self.torrent_result_selected = 0;
                     }
                     if !errors.is_empty() && self.torrent_results.is_empty() {
-                        self.status_message = errors.join(" | ");
+                        self.status_message = redact_url_secrets(&errors.join(" | "));
                     } else {
                         self.status_message =
                             format!("Torrent results: {}", self.torrent_results.len());
@@ -402,11 +406,12 @@ impl App {
                         }
                         Err(e) => {
                             let name = extract_magnet_display_name(&uri);
+                            let safe_err = redact_url_secrets(&e);
                             self.torrent_search_logs.push(format!(
-                                "[ERR] Falló magnet '{}': {e}",
+                                "[ERR] Falló magnet '{}': {safe_err}",
                                 name
                             ));
-                            self.status_message = format!("Torrent err: {e}");
+                            self.status_message = format!("Torrent err: {safe_err}");
                         }
                     }
                 }
@@ -438,7 +443,7 @@ impl App {
                             });
                             tr.source = TrackSource::Torrent {
                                 info_hash: t.info_hash.clone(),
-                                magnet_uri: self.torrent_magnet_input.clone(),
+                                magnet_uri: redact_url_secrets(&self.torrent_magnet_input),
                                 file_index: f.index,
                                 cached_path: Some(f.full_path.to_string_lossy().to_string()),
                             };
@@ -708,9 +713,13 @@ impl App {
             (!clean.is_empty()).then_some(clean.as_str()),
             key_opt.as_deref(),
         ));
+        let safe_url = if clean.is_empty() {
+            "auto".to_string()
+        } else {
+            redact_url_secrets(&clean)
+        };
         self.torrent_search_logs.push(format!(
-            "[INFO] Endpoint Jackett actualizado: {} (providers: {})",
-            if clean.is_empty() { "auto" } else { &clean },
+            "[INFO] Endpoint Jackett actualizado: {safe_url} (providers: {})",
             self.search_provider.provider_names().join(", ")
         ));
     }
@@ -791,7 +800,10 @@ impl App {
 
         let tx = self.async_tx.clone();
         tokio::spawn(async move {
-            let res = engine.add_magnet(&uri).await.map_err(|e| e.to_string());
+            let res = engine
+                .add_magnet(&uri)
+                .await
+                .map_err(|e| redact_url_secrets(&format!("{e:#}")));
             let _ = tx.send(AsyncEvent::TorrentAdded { uri, result: res });
         });
     }
@@ -823,7 +835,7 @@ impl App {
                 });
                 tr.source = TrackSource::Torrent {
                     info_hash: snap.info_hash.clone(),
-                    magnet_uri: self.torrent_magnet_input.clone(),
+                    magnet_uri: redact_url_secrets(&self.torrent_magnet_input),
                     file_index: f.index,
                     cached_path: Some(f.full_path.to_string_lossy().to_string()),
                 };

@@ -15,10 +15,10 @@ fi
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
-# Optional LAN Jackett discovery config (local builds only; skipped on GitHub Actions CI)
+# Optional LAN Jackett discovery config (opt-in local builds only; skipped on GitHub Actions CI)
 LAN_JACKETT_TMP="$DIST_DIR/lan-jackett.json"
-JACKETT_CFG="${HOME}/media-stack/config/jackett/Jackett/ServerConfig.json"
-if [[ -z "${GITHUB_ACTIONS:-}" ]] && [[ -f "$JACKETT_CFG" ]]; then
+JACKETT_CFG="${JACKETT_CONFIG:-${HOME}/media-stack/config/jackett/Jackett/ServerConfig.json}"
+if [[ "${INCLUDE_LAN_JACKETT:-0}" == "1" ]] && [[ -z "${GITHUB_ACTIONS:-}" ]] && [[ -f "$JACKETT_CFG" ]]; then
   LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
   python3 - "$JACKETT_CFG" "$LAN_IP" "$LAN_JACKETT_TMP" << 'PYEOF'
 import json, sys
@@ -34,6 +34,9 @@ if key:
     with open(out_path, "w") as f:
         json.dump({"urls": urls, "api_key": key}, f, indent=2)
 PYEOF
+  if [[ -f "$LAN_JACKETT_TMP" ]]; then
+    echo "WARNING: INCLUDE_LAN_JACKETT=1 embeds your local Jackett API key into the package; do NOT distribute publicly." >&2
+  fi
 fi
 
 # ─── 1. Build Debian/Ubuntu/Kubuntu .deb package (with built-in APT repo) ────

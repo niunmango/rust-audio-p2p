@@ -6,7 +6,7 @@ pub use engine::{
     TorrentFileEntry, TorrentStatusSnapshot, DEFAULT_PORT_RANGE_END, DEFAULT_PORT_RANGE_START,
 };
 pub use search::{
-    parse_torznab_indexers, parse_torznab_xml, CompositeSearchProvider,
+    parse_torznab_indexers, parse_torznab_xml, redact_url_secrets, CompositeSearchProvider,
     InternetArchiveAudioProvider, OpenAudioFallbackProvider, SearchProgressEvent,
     TorrentSearchProvider, TorrentSearchResult, TorznabSearchProvider,
 };

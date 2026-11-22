@@ -6,6 +6,76 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const SECRET_PARAM_PREFIXES: &[&str] = &["apikey=", "api_key=", "passkey=", "token="];
+
+/// Redacts sensitive query parameter values (`apikey`, `jackett_apikey`, `api_key`,
+/// `passkey`, `token`) from URLs and error strings before logging, rendering, or persisting.
+pub fn redact_url_secrets(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut pos = 0usize;
+
+    while pos < lower.len() {
+        let mut earliest: Option<(usize, usize)> = None;
+        for pat in SECRET_PARAM_PREFIXES {
+            if let Some(rel) = lower[pos..].find(pat) {
+                let candidate = (pos + rel, pat.len());
+                if earliest.is_none_or(|best| candidate.0 < best.0) {
+                    earliest = Some(candidate);
+                }
+            }
+        }
+
+        let Some((match_start, key_len)) = earliest else {
+            break;
+        };
+
+        let val_start = match_start + key_len;
+        let val_end = input[val_start..]
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '&' | '"' | '\'' | ')' | '>' | '#')
+            })
+            .map(|off| val_start + off)
+            .unwrap_or(input.len());
+
+        out.push_str(&input[pos..val_start]);
+        out.push_str("***");
+        pos = val_end;
+    }
+
+    if pos == 0 {
+        return input.to_string();
+    }
+    out.push_str(&input[pos..]);
+    out
+}
+
+async fn read_response_text_capped(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> std::result::Result<String, String> {
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes as u64 {
+            return Err(format!(
+                "response too large ({len} bytes > {max_bytes} byte limit)"
+            ));
+        }
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| redact_url_secrets(&e.without_url().to_string()))?
+    {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!("response exceeded {max_bytes} byte limit"));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentSearchResult {
     pub title: String,
@@ -95,6 +165,9 @@ impl TorznabSearchProvider {
 
         // Check local Jackett ServerConfig.json if present on this machine
         let mut server_cfgs = Vec::new();
+        if let Some(cfg) = std::env::var_os("JACKETT_CONFIG").filter(|v| !v.is_empty()) {
+            server_cfgs.push(PathBuf::from(cfg));
+        }
         if let Some(home_dir) = dirs::home_dir() {
             server_cfgs.push(home_dir.join("media-stack/config/jackett/Jackett/ServerConfig.json"));
         }
@@ -163,10 +236,11 @@ impl TorznabSearchProvider {
     ) -> Option<(String, Vec<(String, String)>)> {
         let key = urlencoding::encode(&self.api_key);
         for base in &self.candidate_urls {
+            let safe_base = redact_url_secrets(base);
             let t0 = Instant::now();
             if let Some(tx) = log_tx {
                 let _ = tx.send(SearchProgressEvent::Log(format!(
-                    "[INFO] Jackett: consultando indexers en {base}..."
+                    "[INFO] Jackett: consultando indexers en {safe_base}..."
                 )));
             }
             let url = format!(
@@ -182,19 +256,30 @@ impl TorznabSearchProvider {
                 Ok(resp) => {
                     let status = resp.status();
                     let ms = t0.elapsed().as_millis();
-                    let body = resp.text().await.unwrap_or_default();
+                    let body = match read_response_text_capped(resp, MAX_HTTP_RESPONSE_BYTES).await {
+                        Ok(b) => b,
+                        Err(msg) => {
+                            if let Some(tx) = log_tx {
+                                let _ = tx.send(SearchProgressEvent::Log(format!(
+                                    "[ERR] Jackett ({safe_base}): {msg} ({ms} ms)"
+                                )));
+                            }
+                            continue;
+                        }
+                    };
                     if !status.is_success() {
                         if let Some(tx) = log_tx {
                             let _ = tx.send(SearchProgressEvent::Log(format!(
-                                "[ERR] Jackett ({base}): HTTP {status} ({ms} ms)"
+                                "[ERR] Jackett ({safe_base}): HTTP {status} ({ms} ms)"
                             )));
                         }
                         continue;
                     }
                     if let Some(err_msg) = extract_torznab_error(&body) {
+                        let safe_err = redact_url_secrets(&err_msg);
                         if let Some(tx) = log_tx {
                             let _ = tx.send(SearchProgressEvent::Log(format!(
-                                "[ERR] Jackett ({base}): {err_msg} ({ms} ms)"
+                                "[ERR] Jackett ({safe_base}): {safe_err} ({ms} ms)"
                             )));
                         }
                         continue;
@@ -203,7 +288,7 @@ impl TorznabSearchProvider {
                     if let Some(tx) = log_tx {
                         let names: Vec<_> = indexers.iter().map(|(id, _)| id.as_str()).collect();
                         let _ = tx.send(SearchProgressEvent::Log(format!(
-                            "[OK] Jackett ({base}): {} indexers activos [{}] ({ms} ms)",
+                            "[OK] Jackett ({safe_base}): {} indexers activos [{}] ({ms} ms)",
                             indexers.len(),
                             names.join(", ")
                         )));
@@ -212,9 +297,10 @@ impl TorznabSearchProvider {
                 }
                 Err(e) => {
                     let ms = t0.elapsed().as_millis();
+                    let safe_err = redact_url_secrets(&e.without_url().to_string());
                     if let Some(tx) = log_tx {
                         let _ = tx.send(SearchProgressEvent::Log(format!(
-                            "[ERR] Jackett ({base}): {e} ({ms} ms)"
+                            "[ERR] Jackett ({safe_base}): {safe_err} ({ms} ms)"
                         )));
                     }
                 }
@@ -316,18 +402,22 @@ async fn query_single_indexer(
             if e.is_timeout() {
                 ("TIMEOUT", "sin respuesta (>5000 ms, omitido)".to_string())
             } else {
-                ("ERR", e.to_string())
+                ("ERR", redact_url_secrets(&e.without_url().to_string()))
             }
         })?;
 
     let status = resp.status();
-    let xml = resp.text().await.map_err(|e| ("ERR", e.to_string()))?;
+    let xml = read_response_text_capped(resp, MAX_HTTP_RESPONSE_BYTES)
+        .await
+        .map_err(|m| ("ERR", m))?;
     if !status.is_success() {
-        let detail = extract_torznab_error(&xml).unwrap_or_else(|| format!("HTTP {status}"));
+        let detail = extract_torznab_error(&xml)
+            .map(|m| redact_url_secrets(&m))
+            .unwrap_or_else(|| format!("HTTP {status}"));
         return Err(("ERR", detail));
     }
     if let Some(err_msg) = extract_torznab_error(&xml) {
-        return Err(("ERR", err_msg));
+        return Err(("ERR", redact_url_secrets(&err_msg)));
     }
     Ok(parse_torznab_xml(&xml, &format!("Jackett/{provider_label}")))
 }
@@ -520,11 +610,19 @@ impl TorrentSearchProvider for InternetArchiveAudioProvider {
         let url = format!(
             "https://archive.org/advancedsearch.php?q={encoded}&fl[]=identifier,title,item_size&rows=20&page=1&output=json"
         );
-        let resp = self.client.get(&url).send().await?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("request failed: {}", e.without_url()))?;
         if !resp.status().is_success() {
             anyhow::bail!("HTTP {}", resp.status());
         }
-        let json: serde_json::Value = resp.json().await?;
+        let body = read_response_text_capped(resp, MAX_HTTP_RESPONSE_BYTES)
+            .await
+            .map_err(|m| anyhow::anyhow!("{m}"))?;
+        let json: serde_json::Value = serde_json::from_str(&body)?;
         let docs = json
             .get("response")
             .and_then(|r| r.get("docs"))
@@ -537,6 +635,16 @@ impl TorrentSearchProvider for InternetArchiveAudioProvider {
             let Some(id) = doc.get("identifier").and_then(|v| v.as_str()) else {
                 continue;
             };
+            if id.is_empty()
+                || id.contains('/')
+                || id.contains('\\')
+                || id.contains("..")
+                || id.contains('?')
+                || id.contains('#')
+                || id.chars().any(char::is_whitespace)
+            {
+                continue;
+            }
             let title = doc
                 .get("title")
                 .and_then(|v| v.as_str())
@@ -684,8 +792,9 @@ impl CompositeSearchProvider {
                     }
                 }
                 Err(e) => {
+                    let safe_err = redact_url_secrets(&e.to_string());
                     let _ = tx.send(SearchProgressEvent::Log(format!(
-                        "[ERR] InternetArchive: {e} ({ms} ms)"
+                        "[ERR] InternetArchive: {safe_err} ({ms} ms)"
                     )));
                 }
             }
@@ -695,11 +804,11 @@ impl CompositeSearchProvider {
         let (j_res, a_res) = tokio::join!(jackett_fut, archive_fut);
         match j_res {
             Ok(mut items) => merged.append(&mut items),
-            Err(e) => errors.push(format!("Jackett: {e}")),
+            Err(e) => errors.push(redact_url_secrets(&format!("Jackett: {e}"))),
         }
         match a_res {
             Ok(mut items) => merged.append(&mut items),
-            Err(e) => errors.push(format!("InternetArchive: {e}")),
+            Err(e) => errors.push(redact_url_secrets(&format!("InternetArchive: {e}"))),
         }
 
         if let Ok(mut fb) = self.fallback.search(q).await {
@@ -761,5 +870,28 @@ mod tests {
         let res = p.search("bach").await.unwrap();
         assert_eq!(res.len(), 1);
         assert!(res[0].title.contains("Bach"));
+    }
+
+    #[test]
+    fn test_redact_url_secrets() {
+        assert_eq!(
+            redact_url_secrets("http://localhost:9117/dl/x/?jackett_apikey=abc123&path=Q&file=f"),
+            "http://localhost:9117/dl/x/?jackett_apikey=***&path=Q&file=f"
+        );
+        assert_eq!(
+            redact_url_secrets("GET http://h/api?apikey=SECRET returned 404"),
+            "GET http://h/api?apikey=*** returned 404"
+        );
+        assert_eq!(redact_url_secrets("APIKEY=Z"), "APIKEY=***");
+        assert_eq!(
+            redact_url_secrets("token=t1&passkey=p2&api_key=k3"),
+            "token=***&passkey=***&api_key=***"
+        );
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Kevin+MacLeod";
+        assert_eq!(redact_url_secrets(magnet), magnet);
+        assert_eq!(
+            redact_url_secrets("Almendra – ñ apikey=x"),
+            "Almendra – ñ apikey=***"
+        );
     }
 }
