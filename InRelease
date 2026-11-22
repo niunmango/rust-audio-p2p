@@ -4,30 +4,30 @@ Hash: SHA512
 Architectures: amd64
 Codename: ./
 Components: main
-Date: Sun, 22 Nov 2026 21:22:45 +0000
+Date: Sun, 22 Nov 2026 21:48:11 +0000
 Label: rust-audio-p2p
 Origin: niunmango
 Suite: stable
 MD5Sum:
- 26d3595624c30ae5fccf75045015653a              727 Packages
- d43b5c633d996c5ec61d9cad5fe5be66              535 Packages.gz
- bf69f1e36d5d930df21a458528ac98c1              143 Release
+ 0c777c7fec780330f36f1755c22a5b2f              727 Packages
+ 8a371eff1327f137619a04579be0f38a              533 Packages.gz
+ a63e1edcf3e833481814c39bd0062b05              143 Release
 SHA1:
- 6159429dcb7d991c6d0f82ef1ada98381859d334              727 Packages
- 9610eebf0c5f43834d927d8a6eeb7ff3c1d036c7              535 Packages.gz
- 545e51de46832bc79ddd356bd2144ba3ac165a5d              143 Release
+ 568c048c3f7afa4be0b84382b77ea358ec709c5e              727 Packages
+ 94137c415f6b5fe8db265896f0cfc93e628f5f1b              533 Packages.gz
+ dabb3c116da9682143356061352dbd374c29480f              143 Release
 SHA256:
- 45cd80d139fa6970e16644e09cc9c000b14dbe56db0105ddfec64377ce7824a0              727 Packages
- fe93065d4c4a1bcaee048d1fb480f3505af61032fbdd2744370e8176c5fd4812              535 Packages.gz
- e166dd4020fa781150fa377c5da8c0bef25d5977be4c3d42d0e3c4626499ce4a              143 Release
+ 50eb211325b5d8eddbb45fc480069c491067e5c159b2da65001e319b964bf76b              727 Packages
+ 24428a0c7719f60dff5e360b18ebcc006fed1a9765c2bbb16e786f096c990ff4              533 Packages.gz
+ 4d933cd897353e784ec39321c66bbb6808c08c825c1e0da0bdefd7ecf8bc7a11              143 Release
 SHA512:
- f75c39eddcb6c21a67931b37fb3bc0b8feef5bc75a8111be819c7f252eb88d08c63374a10f36e49e0ae506d1449585f1b2a8e41b2a0d5731d3896d0c5c5ccf0b              727 Packages
- 06ae09ecce075c4980cca6664fc0a3dc09a425723b8ae720b49d1b38d039fcc376e5f3466f06a54614d88afb953a43ef7861ee440ad0164aa3f260a8f5ed2273              535 Packages.gz
- 356c07ce779169afb6b67f18d7775935ad7490795182885499dbe3bbeb53a3e421e369906a1c6953d63357fba7b2b62e694e37bf5f31dc3ff06e4656d6af4391              143 Release
+ f45ddf8370e0ad3d1feccdb388e0464e2c2a2db5c22e9d217e0eb32de8206854cc3ab0237344556dc9be6a48e344e54575b7f603ddecc5a1c521a13f4db0befb              727 Packages
+ e62a1fb7dfda99af2aea2041c43ba346b2c9db7f406ddaa3a659fb679b8d3682d2942948dfac567263a1f76ccbf0decead872850d9a08627dd7c870c71fd0696              533 Packages.gz
+ 4d77a944506c82b1800925866e910ee17db6c3964092d35b15d14d4a712438df1eec22fc3a4ba77988f903cad00d5afdafa85d69b86d6156ffbdba0ff1269613              143 Release
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYKAB0WIQS5h4/rNgLf4YPOY7PPIbZfc83AkQUCawNdJQAKCRDPIbZfc83A
-kf2AAQCCJ9n9gjHEyOKLcqJj/y75scADQ57BK78DHa1Gy3PP8wD/VCDdJQSySdQC
-0XsgkOVsC1Wf0gAlbE5kd4iFYQ88OQA=
-=cFxF
+iHUEARYKAB0WIQS5h4/rNgLf4YPOY7PPIbZfc83AkQUCawNjGwAKCRDPIbZfc83A
+kVT9AQDrNBikGh4N2KjodC8MA46yLT2NgZd/iHyzOpf92/airgD/d5CxUsb+GYy/
+wagYiYn0oJJKaaT9PIzxRml+GbYQTgM=
+=CAGT
 -----END PGP SIGNATURE-----
