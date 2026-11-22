@@ -134,7 +134,7 @@ impl Database {
             album: row.get(5)?,
             year: row.get(6)?,
             track_number: row.get(7)?,
-            duration_secs: row.get(8)?,
+            duration_secs: row.get::<_, Option<i64>>(8)?.map(|d| d.max(0) as u64),
             file_size_bytes: row.get::<_, i64>(9)?.max(0) as u64,
             format: row.get(10)?,
             cover_path: row.get(11)?,
