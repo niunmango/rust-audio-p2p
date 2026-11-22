@@ -1,4 +1,4 @@
-20a1fbe415e014acc7e75836ff42307ff8b187424954f6800f642fa3b99a32bd  rust-audio-p2p_0.1.5_amd64.deb
-20a1fbe415e014acc7e75836ff42307ff8b187424954f6800f642fa3b99a32bd  rust-audio-p2p_latest_amd64.deb
-ed7f5c7f39045cfc70e85ad40e954afd208ae04f3504ad9e4d41c113b070489f  rust-audio-p2p-0.1.5-x86_64.AppImage
-ed7f5c7f39045cfc70e85ad40e954afd208ae04f3504ad9e4d41c113b070489f  rust-audio-p2p-latest-x86_64.AppImage
+b6e57c18c16f8db2d4731cb50b4c2b20a45c20e48550c873f8075c0b61936ef2  rust-audio-p2p_0.1.6_amd64.deb
+b6e57c18c16f8db2d4731cb50b4c2b20a45c20e48550c873f8075c0b61936ef2  rust-audio-p2p_latest_amd64.deb
+00aee42d4e7bde5a44e0bc486636a6e1b125eff003edd5b01004d9d2ee9a762d  rust-audio-p2p-0.1.6-x86_64.AppImage
+00aee42d4e7bde5a44e0bc486636a6e1b125eff003edd5b01004d9d2ee9a762d  rust-audio-p2p-latest-x86_64.AppImage
