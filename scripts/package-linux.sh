@@ -113,7 +113,7 @@ Section: sound
 Priority: optional
 Architecture: amd64
 Installed-Size: $INSTALLED_KB
-Depends: libc6, libasound2t64 | libasound2
+Depends: libc6, libasound2t64 | libasound2, libxkbcommon0, libxkbcommon-x11-0, libgl1
 Maintainer: niunmango <niunmango@yahoo.com>
 Homepage: https://github.com/niunmango/rust-audio-p2p
 Description: Distributed Audio Player & P2P Network in Rust (TUI + GUI + Web)

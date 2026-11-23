@@ -175,6 +175,8 @@ pub struct WebPlayerSnapshot {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum WebRemoteCommand {
     PlayTrack { track_id: i64 },
+    EnqueueTrack { track_id: i64 },
+    EnqueueTracks { track_ids: Vec<i64> },
     TogglePause,
     Next,
     Prev,

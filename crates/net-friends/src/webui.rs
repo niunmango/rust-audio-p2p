@@ -142,6 +142,7 @@ pub const INDEX_HTML: &str = r##"<!doctype html>
       <span id="batchCount" style="font-weight:700;color:var(--accent);"></span>
       <div class="pill-row">
         <button id="selectVisibleBtn"></button>
+        <button id="batchEnqueueBtn"></button>
         <button id="batchAddPlBtn" class="green"></button>
         <button id="clearSelBtn"></button>
       </div>
@@ -308,6 +309,9 @@ const STR = {
     selectedOne: "1 pista",
     selectedMany: "{n} pistas seleccionadas",
     selectVisible: "☑ Sel. visibles",
+    batchEnqueue: "+ Agregar a Fila",
+    enqueueRow: "+Fila",
+    queueLabel: "Fila",
     batchAddPl: "+ Agregar a Playlist",
     clearSel: "✖ Limpiar",
     close: "Cerrar",
@@ -354,6 +358,9 @@ const STR = {
     selectedOne: "1 track",
     selectedMany: "{n} tracks selected",
     selectVisible: "☑ Select visible",
+    batchEnqueue: "+ Add to Queue",
+    enqueueRow: "+Q",
+    queueLabel: "Queue",
     batchAddPl: "+ Add to Playlist",
     clearSel: "✖ Clear",
     close: "Close",
@@ -420,6 +427,7 @@ function applyLang() {
   document.getElementById("confirmDeletePlBtn").textContent = t("confirmDeleteYes");
   document.getElementById("cancelDeletePlBtn").textContent = t("cancel");
   document.getElementById("selectVisibleBtn").textContent = t("selectVisible");
+  document.getElementById("batchEnqueueBtn").textContent = t("batchEnqueue");
   document.getElementById("batchAddPlBtn").textContent = t("batchAddPl");
   document.getElementById("clearSelBtn").textContent = t("clearSel");
   document.getElementById("p2pNodeTitle").textContent = t("p2pNode");
@@ -567,6 +575,13 @@ function renderTrackList(containerId, list, opts = {}) {
       await loadCatalog();
     };
 
+    const queueBtn = document.createElement("button");
+    queueBtn.textContent = t("enqueueRow");
+    queueBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      enqueueTracks([tr]);
+    };
+
     const addBtn = document.createElement("button");
     addBtn.textContent = "+PL";
     addBtn.onclick = (ev) => {
@@ -574,7 +589,7 @@ function renderTrackList(containerId, list, opts = {}) {
       openPlPicker([tr.id]);
     };
 
-    actions.append(badge, pinBtn, addBtn);
+    actions.append(badge, pinBtn, queueBtn, addBtn);
     if (opts.playlistId != null) {
       const remBtn = document.createElement("button");
       remBtn.className = "danger";
@@ -740,7 +755,11 @@ function updateMediaSession(tr) {
 function updatePlayerUi() {
   const tr = activeCurrentTrack();
   document.getElementById("nowTitle").textContent = tr ? tr.title : "—";
-  document.getElementById("nowSub").textContent = tr ? (tr.artist + " — " + tr.album) : "rust-audio-p2p";
+  let sub = tr ? (tr.artist + " — " + tr.album) : "rust-audio-p2p";
+  if (st.mode === "browser" && st.queue.length > 0 && st.queueIdx >= 0) {
+    sub += " · " + t("queueLabel") + " " + (st.queueIdx + 1) + "/" + st.queue.length;
+  }
+  document.getElementById("nowSub").textContent = sub;
   const coverEl = document.getElementById("coverImg");
   if (tr) {
     coverEl.src = "/api/v1/cover/" + tr.id + "?token=" + encodeURIComponent(st.token);
@@ -945,9 +964,39 @@ document.getElementById("selectVisibleBtn").onclick = () => {
   if (st.searchTracks.length) renderTrackList("searchList", st.searchTracks);
   renderPlaylists();
 };
+document.getElementById("batchEnqueueBtn").onclick = () => {
+  if (st.selectedIds.size === 0) return;
+  const list = Array.from(st.selectedIds).map(id => st.trackMap.get(id)).filter(Boolean);
+  enqueueTracks(list);
+  st.selectedIds.clear();
+  updateBatchBar();
+  refreshFilteredLibrary();
+  if (st.searchTracks.length) renderTrackList("searchList", st.searchTracks);
+  renderPlaylists();
+};
 document.getElementById("batchAddPlBtn").onclick = () => {
   if (st.selectedIds.size > 0) openPlPicker(Array.from(st.selectedIds));
 };
+
+async function enqueueTracks(list) {
+  if (!list || list.length === 0) return;
+  if (st.mode === "remote") {
+    if (list.length === 1) {
+      await sendControl({ action: "enqueue_track", track_id: list[0].id });
+    } else {
+      await sendControl({ action: "enqueue_tracks", track_ids: list.map(x => x.id) });
+    }
+    return;
+  }
+  const startIdx = st.queue.length;
+  for (const item of list) st.queue.push(item);
+  if (st.queueIdx < 0 || !audio.src || (audio.paused && audio.ended)) {
+    st.queueIdx = startIdx;
+    startBrowserTrack(st.queue[st.queueIdx]);
+  } else {
+    updatePlayerUi();
+  }
+}
 document.getElementById("clearSelBtn").onclick = () => {
   st.selectedIds.clear();
   updateBatchBar();

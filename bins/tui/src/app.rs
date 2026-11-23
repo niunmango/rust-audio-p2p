@@ -103,7 +103,9 @@ pub struct UiLayout {
     pub player_bar: Rect,
     pub player_gauge: Rect,
     pub auto_next_pill: Rect,
+    pub help_btn: Rect,
     pub add_playlist_btn: Rect,
+    pub enqueue_btn: Rect,
     pub modal_box: Rect,
     pub modal_list: Rect,
 }
@@ -160,6 +162,8 @@ pub struct App {
     pub active_tab: Tab,
     pub tracks: Vec<Track>,
     pub library_selected: usize,
+    pub library_filter: String,
+    pub library_filtering: bool,
     pub search_query: String,
     pub search_editing: bool,
     pub search_results: Vec<Track>,
@@ -199,6 +203,7 @@ pub struct App {
     pub peer_connect_input: String,
     pub peer_connect_editing: bool,
     pub show_qr_modal: bool,
+    pub show_help_modal: bool,
     pub p2p_logs: Vec<String>,
     pub pending_peer_downloads: HashMap<String, PeerDownloadIntent>,
     pub web_cmd_rx: mpsc::UnboundedReceiver<WebRemoteCommand>,
@@ -262,16 +267,87 @@ impl App {
         let (web_cmd_tx, web_cmd_rx) = mpsc::unbounded_channel();
         let watcher_slot = Arc::new(Mutex::new(None));
 
+        let mut app = Self {
+            paths: paths.clone(),
+            db: Arc::clone(&db),
+            cache,
+            i18n,
+            queue: PlaybackQueue::new(),
+            player,
+            auto_next: true,
+            torrent_engine: None,
+            search_provider,
+            scan_root: scan_root.clone(),
+            scan_tx: scan_tx.clone(),
+            scan_rx,
+            async_tx: async_tx.clone(),
+            async_rx,
+            active_tab: Tab::Library,
+            tracks: Vec::new(),
+            library_selected: 0,
+            library_filter: String::new(),
+            library_filtering: false,
+            search_query: String::new(),
+            search_editing: false,
+            search_results: Vec::new(),
+            search_selected: 0,
+            playlists: Vec::new(),
+            playlist_selected: 0,
+            selected_playlist_tracks: Vec::new(),
+            playlist_track_selected: 0,
+            playlist_focus: PlaylistPanelFocus::Playlists,
+            pinned_tracks: Vec::new(),
+            playlist_input: String::new(),
+            playlist_editing: false,
+            playlist_renaming: false,
+            marked_track_ids: HashSet::new(),
+            playlist_picker: None,
+            torrent_query: String::new(),
+            torrent_magnet_input: String::new(),
+            jackett_url_input,
+            torrent_input_mode: TorrentInputMode::None,
+            torrent_searching: false,
+            torrent_search_ticks: 0,
+            torrent_search_logs: Vec::new(),
+            torrent_results: Vec::new(),
+            torrent_result_selected: 0,
+            pending_magnets: Vec::new(),
+            pending_queued_uris: Vec::new(),
+            active_torrents: Vec::new(),
+            active_torrent_selected: 0,
+            synced_torrent_hashes: HashSet::new(),
+            node_identity: node_identity.clone(),
+            p2p_server: None,
+            p2p_client: p2p_client.clone(),
+            paired_peers: paired_peers.clone(),
+            peer_selected: 0,
+            peer_tracks: Vec::new(),
+            peer_track_selected: 0,
+            peer_connect_input: String::new(),
+            peer_connect_editing: false,
+            show_qr_modal: false,
+            show_help_modal: false,
+            p2p_logs: Vec::new(),
+            pending_peer_downloads: HashMap::new(),
+            web_cmd_rx,
+            cache_stats,
+            status_message: String::new(),
+            should_quit: false,
+            layout: RefCell::new(UiLayout::default()),
+            watcher_slot: Arc::clone(&watcher_slot),
+        };
+        app.refresh_from_db()?;
+
         if start_background_services {
-            // Scan & watcher attach completely asynchronously without blocking initial UI draw.
+            // Scan & watcher attach completely asynchronously after initial DB load.
             spawn_home_scan(
-                scan_root.clone(),
+                scan_root,
                 Arc::clone(&db),
-                scan_tx.clone(),
-                Some(Arc::clone(&watcher_slot)),
+                scan_tx,
+                Some(watcher_slot),
             );
 
-            let dl_dir = paths.torrent_download_dir.clone();
+            let dl_dir = paths.torrent_download_dir;
             let tx = async_tx.clone();
             tokio::spawn(async move {
                 match TorrentEngine::new(dl_dir).await {
@@ -285,12 +361,12 @@ impl App {
             });
 
             // Start lightweight P2P node server + Web UI/PWA + initial LAN discovery + existing peers refresh
-            let p2p_db = Arc::clone(&db);
-            let p2p_id = node_identity.clone();
-            let p2p_tx = async_tx.clone();
-            let client_clone = p2p_client.clone();
-            let existing_peers = paired_peers.clone();
-            let web_tx = web_cmd_tx.clone();
+            let p2p_db = db;
+            let p2p_id = node_identity;
+            let p2p_tx = async_tx;
+            let client_clone = p2p_client;
+            let existing_peers = paired_peers;
+            let web_tx = web_cmd_tx;
             tokio::spawn(async move {
                 match FriendNodeServer::start_with_control(p2p_db, p2p_id, Some(web_tx)).await {
                     Ok(srv) => {
@@ -326,82 +402,18 @@ impl App {
             });
         }
 
-        let mut app = Self {
-            paths,
-            db,
-            cache,
-            i18n,
-            queue: PlaybackQueue::new(),
-            player,
-            auto_next: true,
-            torrent_engine: None,
-            search_provider,
-            scan_root,
-            scan_tx,
-            scan_rx,
-            async_tx,
-            async_rx,
-            active_tab: Tab::Library,
-            tracks: Vec::new(),
-            library_selected: 0,
-            search_query: String::new(),
-            search_editing: false,
-            search_results: Vec::new(),
-            search_selected: 0,
-            playlists: Vec::new(),
-            playlist_selected: 0,
-            selected_playlist_tracks: Vec::new(),
-            playlist_track_selected: 0,
-            playlist_focus: PlaylistPanelFocus::Playlists,
-            pinned_tracks: Vec::new(),
-            playlist_input: String::new(),
-            playlist_editing: false,
-            playlist_renaming: false,
-            marked_track_ids: HashSet::new(),
-            playlist_picker: None,
-            torrent_query: String::new(),
-            torrent_magnet_input: String::new(),
-            jackett_url_input,
-            torrent_input_mode: TorrentInputMode::None,
-            torrent_searching: false,
-            torrent_search_ticks: 0,
-            torrent_search_logs: Vec::new(),
-            torrent_results: Vec::new(),
-            torrent_result_selected: 0,
-            pending_magnets: Vec::new(),
-            pending_queued_uris: Vec::new(),
-            active_torrents: Vec::new(),
-            active_torrent_selected: 0,
-            synced_torrent_hashes: HashSet::new(),
-            node_identity,
-            p2p_server: None,
-            p2p_client,
-            paired_peers,
-            peer_selected: 0,
-            peer_tracks: Vec::new(),
-            peer_track_selected: 0,
-            peer_connect_input: String::new(),
-            peer_connect_editing: false,
-            show_qr_modal: false,
-            p2p_logs: Vec::new(),
-            pending_peer_downloads: HashMap::new(),
-            web_cmd_rx,
-            cache_stats,
-            status_message: String::new(),
-            should_quit: false,
-            layout: RefCell::new(UiLayout::default()),
-            watcher_slot,
-        };
-        app.refresh_from_db()?;
         Ok(app)
     }
 
     pub fn switch_tab(&mut self, tab: Tab) {
         self.active_tab = tab;
         self.search_editing = tab == Tab::Search;
+        self.library_filtering = false;
         self.playlist_editing = false;
+        self.playlist_renaming = false;
         self.peer_connect_editing = false;
         self.show_qr_modal = false;
+        self.show_help_modal = false;
         if tab == Tab::Torrents {
             if self.torrent_results.is_empty() && self.torrent_query.is_empty() {
                 self.torrent_input_mode = TorrentInputMode::Search;
@@ -718,6 +730,29 @@ impl App {
                         }
                     }
                 }
+                WebRemoteCommand::EnqueueTrack { track_id } => {
+                    let fetched = self
+                        .db
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.get_track(track_id).ok().flatten());
+                    if let Some(tr) = fetched {
+                        let _ = self.enqueue_tracks(std::slice::from_ref(&tr));
+                    }
+                }
+                WebRemoteCommand::EnqueueTracks { track_ids } => {
+                    let mut fetched = Vec::new();
+                    if let Ok(guard) = self.db.lock() {
+                        for id in track_ids {
+                            if let Ok(Some(tr)) = guard.get_track(id) {
+                                fetched.push(tr);
+                            }
+                        }
+                    }
+                    if !fetched.is_empty() {
+                        let _ = self.enqueue_tracks(&fetched);
+                    }
+                }
                 WebRemoteCommand::TogglePause => {
                     let _ = self.player.toggle_pause();
                 }
@@ -793,9 +828,29 @@ impl App {
         });
     }
 
+    pub fn filtered_library_tracks(&self) -> Vec<Track> {
+        let q = self.library_filter.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return self.tracks.clone();
+        }
+        self.tracks
+            .iter()
+            .filter(|t| {
+                t.title.to_ascii_lowercase().contains(&q)
+                    || t.artist.to_ascii_lowercase().contains(&q)
+                    || t.album.to_ascii_lowercase().contains(&q)
+                    || t.format.to_ascii_lowercase().contains(&q)
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn selected_track_in_active_tab(&self) -> Option<Track> {
         match self.active_tab {
-            Tab::Library => self.tracks.get(self.library_selected).cloned(),
+            Tab::Library => self
+                .filtered_library_tracks()
+                .get(self.library_selected)
+                .cloned(),
             Tab::Search => self.search_results.get(self.search_selected).cloned(),
             Tab::Friends => self.peer_tracks.get(self.peer_track_selected).cloned(),
             Tab::Playlists if self.playlist_focus == PlaylistPanelFocus::PlaylistTracks => {
@@ -808,8 +863,12 @@ impl App {
     }
 
     pub fn play_selected_from_active_list(&mut self) -> Result<()> {
+        let owned_lib;
         let (list, idx) = match self.active_tab {
-            Tab::Library => (&self.tracks, self.library_selected),
+            Tab::Library => {
+                owned_lib = self.filtered_library_tracks();
+                (&owned_lib, self.library_selected)
+            }
             Tab::Search => (&self.search_results, self.search_selected),
             Tab::Friends => (&self.peer_tracks, self.peer_track_selected),
             Tab::Playlists => (&self.selected_playlist_tracks, self.playlist_track_selected),
@@ -938,8 +997,9 @@ impl App {
             if !self.marked_track_ids.remove(&tr.id) {
                 self.marked_track_ids.insert(tr.id);
                 // Advance cursor for rapid sequential selection
+                let lib_len = self.filtered_library_tracks().len();
                 match self.active_tab {
-                    Tab::Library if self.library_selected + 1 < self.tracks.len() => {
+                    Tab::Library if self.library_selected + 1 < lib_len => {
                         self.library_selected += 1;
                     }
                     Tab::Search if self.search_selected + 1 < self.search_results.len() => {
@@ -996,6 +1056,42 @@ impl App {
             }
         }
         self.selected_track_in_active_tab().into_iter().collect()
+    }
+
+    pub fn enqueue_tracks(&mut self, tracks: &[Track]) -> Result<()> {
+        if tracks.is_empty() {
+            return Ok(());
+        }
+        let should_start =
+            self.queue.is_empty() || self.player.status().state == PlaybackState::Stopped;
+        let start_idx = self.queue.len();
+        self.queue.enqueue_many(tracks.iter().cloned());
+        if should_start {
+            let target_idx = if start_idx < self.queue.len() {
+                start_idx
+            } else {
+                0
+            };
+            self.queue.jump_to(target_idx);
+            self.play_current_in_queue()?;
+        } else {
+            let _ = self
+                .player
+                .set_prefetch(self.queue.peek_next_for_prefetch().cloned());
+        }
+        let total = self.queue.len();
+        self.status_message = if tracks.len() == 1 {
+            self.i18n.added_to_queue(&tracks[0].title, total)
+        } else {
+            self.i18n.added_multiple_to_queue(tracks.len(), total)
+        };
+        self.marked_track_ids.clear();
+        Ok(())
+    }
+
+    pub fn enqueue_selected_or_marked(&mut self) -> Result<()> {
+        let tracks = self.collect_marked_tracks_or_selected();
+        self.enqueue_tracks(&tracks)
     }
 
     pub fn open_playlist_picker_for_selected(&mut self) {

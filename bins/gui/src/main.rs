@@ -23,6 +23,7 @@ struct CliArgs {
     headless: bool,
     lang: Option<LanguagePreference>,
     scan_dir: Option<PathBuf>,
+    tab: Option<String>,
 }
 
 fn parse_args() -> Result<CliArgs> {
@@ -33,6 +34,7 @@ fn parse_args() -> Result<CliArgs> {
         headless: false,
         lang: None,
         scan_dir: None,
+        tab: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -52,6 +54,12 @@ fn parse_args() -> Result<CliArgs> {
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--scan-dir requires a path"))?;
                 out.scan_dir = Some(PathBuf::from(val));
+            }
+            "--tab" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--tab requires 1..6 or help"))?;
+                out.tab = Some(val);
             }
             other => anyhow::bail!("Unknown argument: {other}. Try --help."),
         }
@@ -124,13 +132,25 @@ fn main() -> Result<()> {
     paths.ensure_dirs()?;
     let db = Database::open(&paths.db_path)?;
     let scan_root = cli.scan_dir.unwrap_or_else(default_scan_root);
-    let state = GuiState::new(paths, db, cli.lang, scan_root, cli.headless, true)?;
+    let mut state = GuiState::new(paths, db, cli.lang, scan_root, cli.headless, true)?;
+    if let Some(ref tab_arg) = cli.tab {
+        match tab_arg.to_ascii_lowercase().as_str() {
+            "1" | "library" => state.active_tab = GuiTab::Library,
+            "2" | "search" => state.active_tab = GuiTab::Search,
+            "3" | "playlists" => state.active_tab = GuiTab::Playlists,
+            "4" | "torrents" => state.active_tab = GuiTab::Torrents,
+            "5" | "cache" => state.active_tab = GuiTab::CacheSettings,
+            "6" | "p2p" | "friends" => state.active_tab = GuiTab::Friends,
+            "help" => state.show_help_modal = true,
+            _ => {}
+        }
+    }
 
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1140.0, 740.0])
-            .with_min_inner_size([800.0, 520.0])
+            .with_inner_size([1240.0, 780.0])
+            .with_min_inner_size([860.0, 560.0])
             .with_title("rust-audio-p2p"),
         ..Default::default()
     };
@@ -316,6 +336,12 @@ mod tests {
                 });
                 assert!(!output.shapes.is_empty());
             }
+            state.show_help_modal = true;
+            let help_out = ctx.run(egui::RawInput::default(), |c| {
+                ui::render_gui(c, &mut state);
+            });
+            assert!(!help_out.shapes.is_empty());
+            state.show_help_modal = false;
         }
 
         // Exercise multi-select batch add + rename + delete in GUI state
@@ -333,6 +359,12 @@ mod tests {
         assert_eq!(state.playlists[0].name, "GUI Renamed");
         state.delete_playlist(pl_id, "GUI Renamed").unwrap();
         assert!(state.playlists.is_empty());
+
+        // Exercise enqueue_marked_tracks
+        state.marked_track_ids.insert(t_id);
+        state.enqueue_marked_tracks().unwrap();
+        assert_eq!(state.queue.len(), 1);
+        assert!(state.marked_track_ids.is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_base);
     }

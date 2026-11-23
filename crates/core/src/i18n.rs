@@ -419,8 +419,8 @@ impl I18n {
 
     pub fn help_footer(&self) -> &'static str {
         self.t(
-            "1-6: Pestañas | Enter: Reprod | Space: Pausa | ←/→: Seek | +/-: Vol | n/b: Sig/Ant | A: Auto-Sig | x/X: Marcar/Limpiar | a: +Playlist | p: Pin | /: Buscar | q: Salir",
-            "1-6: Tabs | Enter: Play | Space: Pause | ←/→: Seek | +/-: Vol | n/b: Next/Prev | A: Auto-Next | x/X: Mark/Clear | a: +Playlist | p: Pin | /: Search | q: Quit",
+            "1-6: Tabs | Enter: Reprod | Space: Pausa | ←/→: Seek | +/-: Vol | n/b: Sig/Ant | w: +Fila | x/X: Marcar | a: +Playlist | p: Pin | /: Buscar | ?: Ayuda | q: Salir",
+            "1-6: Tabs | Enter: Play | Space: Pause | ←/→: Seek | +/-: Vol | n/b: Next/Prev | w: +Queue | x/X: Mark | a: +Playlist | p: Pin | /: Search | ?: Help | q: Quit",
         )
     }
 
@@ -479,6 +479,175 @@ impl I18n {
         match self.lang {
             Language::Es => format!("Caché purgada: {count} entradas ({freed_mb:.2} MB liberados)"),
             Language::En => format!("Cache purged: {count} entries ({freed_mb:.2} MB freed)"),
+        }
+    }
+
+    pub fn help_btn_label(&self) -> &'static str {
+        self.t("? Ayuda (F1)", "? Help (F1)")
+    }
+
+    pub fn help_modal_title(&self) -> &'static str {
+        self.t(
+            "Ayuda Rápida y Atajos — rust-audio-p2p",
+            "Quick Help & Shortcuts — rust-audio-p2p",
+        )
+    }
+
+    pub fn help_modal_sections(&self) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+        match self.lang {
+            Language::Es => vec![
+                (
+                    "Reproducción y Navegación",
+                    vec![
+                        ("Space", "Pausar / Reanudar"),
+                        ("Enter / Doble Clic", "Reproducir pista seleccionada"),
+                        ("w / +Fila", "Agregar pista(s) a la fila de reproducción"),
+                        ("<- / ->", "Retroceder / Adelantar 10 segundos"),
+                        ("+ / -", "Subir / Bajar volumen"),
+                        ("n / b", "Siguiente / Anterior pista"),
+                        ("A", "Alternar Auto-Siguiente"),
+                        ("1..6 / Alt+1..6", "Cambiar de sección"),
+                    ],
+                ),
+                (
+                    "Selección Múltiple y Playlists",
+                    vec![
+                        ("x / Casilla", "Marcar / Desmarcar varias pistas"),
+                        ("X", "Limpiar selección múltiple"),
+                        ("a / +PL", "Agregar pista(s) a una Playlist"),
+                        ("p / ★", "Fijar Pin Offline (Modo Viaje)"),
+                        ("n / e / d (Tab 3)", "Nueva / Renombrar / Borrar playlist o quitar tema"),
+                    ],
+                ),
+                (
+                    "Búsqueda y Biblioteca",
+                    vec![
+                        ("/ o Tab 2", "Buscar con motor SQLite FTS5"),
+                        ("f (TUI Tab 1)", "Filtro rápido en Biblioteca"),
+                        ("r", "Re-escanear carpeta de música"),
+                    ],
+                ),
+                (
+                    "Red P2P, Web UI y Torrents",
+                    vec![
+                        ("c / d / s / v (Tab 6)", "Conectar nodo / LAN scan / LAN On-Off / Ver QR"),
+                        ("Web UI / PWA", "Abrí http://<IP_LAN>:4261 en navegador o celular"),
+                        ("Pegar magnet / rap2p://", "Encola torrent o conecta nodo P2P al instante"),
+                        ("? / F1 / Esc", "Abrir o cerrar esta ventana de ayuda"),
+                    ],
+                ),
+            ],
+            Language::En => vec![
+                (
+                    "Playback & Navigation",
+                    vec![
+                        ("Space", "Pause / Resume"),
+                        ("Enter / Double Click", "Play selected track"),
+                        ("w / +Queue", "Add track(s) to playback queue"),
+                        ("<- / ->", "Seek -10s / +10s"),
+                        ("+ / -", "Volume Up / Down"),
+                        ("n / b", "Next / Previous track"),
+                        ("A", "Toggle Auto-Next"),
+                        ("1..6 / Alt+1..6", "Switch section"),
+                    ],
+                ),
+                (
+                    "Multi-Select & Playlists",
+                    vec![
+                        ("x / Checkbox", "Mark / Unmark multiple tracks"),
+                        ("X", "Clear multi-selection"),
+                        ("a / +PL", "Add track(s) to a Playlist"),
+                        ("p / ★", "Toggle Offline Travel Pin"),
+                        ("n / e / d (Tab 3)", "New / Rename / Delete playlist or remove track"),
+                    ],
+                ),
+                (
+                    "Search & Library",
+                    vec![
+                        ("/ or Tab 2", "Search with SQLite FTS5 engine"),
+                        ("f (TUI Tab 1)", "Quick filter in Library"),
+                        ("r", "Rescan music directory"),
+                    ],
+                ),
+                (
+                    "P2P Net, Web UI & Torrents",
+                    vec![
+                        ("c / d / s / v (Tab 6)", "Connect peer / LAN scan / LAN On-Off / Show QR"),
+                        ("Web UI / PWA", "Open http://<LAN_IP>:4261 in browser or phone"),
+                        ("Paste magnet / rap2p://", "Auto-queues torrent or connects P2P node"),
+                        ("? / F1 / Esc", "Open or close this help window"),
+                    ],
+                ),
+            ],
+        }
+    }
+
+    pub fn col_duration(&self) -> &'static str {
+        self.t("Dur", "Dur")
+    }
+
+    pub fn filter_all(&self) -> &'static str {
+        self.t("Todas", "All")
+    }
+
+    pub fn filter_pinned(&self) -> &'static str {
+        self.t("★ Viaje", "★ Travel")
+    }
+
+    pub fn filter_p2p(&self) -> &'static str {
+        self.t("P2P Remotas", "P2P Remote")
+    }
+
+    pub fn select_all_visible(&self) -> &'static str {
+        self.t("Sel. visibles", "Select visible")
+    }
+
+    pub fn clear_selection(&self) -> &'static str {
+        self.t("Limpiar", "Clear")
+    }
+
+    pub fn rename_btn(&self) -> &'static str {
+        self.t("Renombrar", "Rename")
+    }
+
+    pub fn delete_btn(&self) -> &'static str {
+        self.t("Borrar", "Delete")
+    }
+
+    pub fn save_btn(&self) -> &'static str {
+        self.t("Guardar", "Save")
+    }
+
+    pub fn cancel_btn(&self) -> &'static str {
+        self.t("Cancelar", "Cancel")
+    }
+
+    pub fn enqueue_btn(&self) -> &'static str {
+        self.t("+Fila", "+Queue")
+    }
+
+    pub fn batch_enqueue_btn(&self) -> &'static str {
+        self.t("+ Agregar a Fila", "+ Add to Queue")
+    }
+
+    pub fn added_to_queue(&self, title: &str, total: usize) -> String {
+        match self.lang {
+            Language::Es => format!("Encolada '{title}' ({total} en fila)"),
+            Language::En => format!("Queued '{title}' ({total} in queue)"),
+        }
+    }
+
+    pub fn added_multiple_to_queue(&self, count: usize, total: usize) -> String {
+        match self.lang {
+            Language::Es => format!("Encoladas {count} pistas ({total} en fila)"),
+            Language::En => format!("Queued {count} tracks ({total} in queue)"),
+        }
+    }
+
+    pub fn queue_badge(&self, cur: usize, total: usize) -> String {
+        match self.lang {
+            Language::Es => format!("Fila {cur}/{total}"),
+            Language::En => format!("Queue {cur}/{total}"),
         }
     }
 }

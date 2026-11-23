@@ -23,6 +23,13 @@ use rust_audio_source_torrent::{
 use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibrarySourceFilter {
+    All,
+    PinnedOnly,
+    PeerOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuiTab {
     Library,
     Search,
@@ -108,7 +115,10 @@ pub struct GuiState {
     pub async_rx: mpsc::UnboundedReceiver<AsyncEvent>,
     pub web_cmd_rx: mpsc::UnboundedReceiver<WebRemoteCommand>,
     pub active_tab: GuiTab,
+    pub show_help_modal: bool,
     pub library_filter: String,
+    pub library_source_filter: LibrarySourceFilter,
+    pub selected_row_idx: usize,
     pub tracks: Vec<Track>,
     pub search_query: String,
     pub search_results: Vec<Track>,
@@ -198,15 +208,75 @@ impl GuiState {
         let (web_cmd_tx, web_cmd_rx) = mpsc::unbounded_channel();
         let watcher_slot = Arc::new(Mutex::new(None));
 
+        let mut st = Self {
+            paths: paths.clone(),
+            db: Arc::clone(&db),
+            cache,
+            i18n,
+            queue: PlaybackQueue::new(),
+            player,
+            auto_next: true,
+            seek_preview: None,
+            torrent_engine: None,
+            search_provider,
+            scan_root: scan_root.clone(),
+            scan_tx: scan_tx.clone(),
+            scan_rx,
+            async_tx: async_tx.clone(),
+            async_rx,
+            web_cmd_rx,
+            active_tab: GuiTab::Library,
+            show_help_modal: false,
+            library_filter: String::new(),
+            library_source_filter: LibrarySourceFilter::All,
+            selected_row_idx: 0,
+            tracks: Vec::new(),
+            search_query: String::new(),
+            search_results: Vec::new(),
+            playlists: Vec::new(),
+            selected_playlist_idx: None,
+            selected_playlist_tracks: Vec::new(),
+            new_playlist_input: String::new(),
+            rename_playlist_id: None,
+            rename_playlist_input: String::new(),
+            marked_track_ids: HashSet::new(),
+            pinned_tracks: Vec::new(),
+            playlist_picker: None,
+            torrent_query: String::new(),
+            torrent_magnet_input: String::new(),
+            jackett_url_input,
+            torrent_searching: false,
+            torrent_search_ticks: 0.0,
+            torrent_search_logs: Vec::new(),
+            torrent_results: Vec::new(),
+            pending_magnets: Vec::new(),
+            pending_queued_uris: Vec::new(),
+            active_torrents: Vec::new(),
+            synced_torrent_hashes: HashSet::new(),
+            node_identity: node_identity.clone(),
+            p2p_server: None,
+            p2p_client: p2p_client.clone(),
+            paired_peers: paired_peers.clone(),
+            peer_tracks: Vec::new(),
+            peer_connect_input: String::new(),
+            p2p_logs: Vec::new(),
+            pending_peer_downloads: HashMap::new(),
+            cache_stats,
+            status_message: String::new(),
+            watcher_slot: Arc::clone(&watcher_slot),
+        };
+        // Populate initial UI from SQLite before background directory walking acquires DB locks.
+        st.refresh_from_db()?;
+
         if start_background_services {
             spawn_home_scan(
-                scan_root.clone(),
+                scan_root,
                 Arc::clone(&db),
-                scan_tx.clone(),
-                Some(Arc::clone(&watcher_slot)),
+                scan_tx,
+                Some(watcher_slot),
             );
 
-            let dl_dir = paths.torrent_download_dir.clone();
+            let dl_dir = paths.torrent_download_dir;
             let tx = async_tx.clone();
             tokio::spawn(async move {
                 match TorrentEngine::new(dl_dir).await {
@@ -219,12 +289,12 @@ impl GuiState {
                 }
             });
 
-            let p2p_db = Arc::clone(&db);
-            let p2p_id = node_identity.clone();
-            let p2p_tx = async_tx.clone();
-            let client_clone = p2p_client.clone();
-            let existing_peers = paired_peers.clone();
-            let web_tx = web_cmd_tx.clone();
+            let p2p_db = db;
+            let p2p_id = node_identity;
+            let p2p_tx = async_tx;
+            let client_clone = p2p_client;
+            let existing_peers = paired_peers;
+            let web_tx = web_cmd_tx;
             tokio::spawn(async move {
                 match FriendNodeServer::start_with_control(p2p_db, p2p_id, Some(web_tx)).await {
                     Ok(srv) => {
@@ -259,61 +329,6 @@ impl GuiState {
             });
         }
 
-        let mut st = Self {
-            paths,
-            db,
-            cache,
-            i18n,
-            queue: PlaybackQueue::new(),
-            player,
-            auto_next: true,
-            seek_preview: None,
-            torrent_engine: None,
-            search_provider,
-            scan_root,
-            scan_tx,
-            scan_rx,
-            async_tx,
-            async_rx,
-            web_cmd_rx,
-            active_tab: GuiTab::Library,
-            library_filter: String::new(),
-            tracks: Vec::new(),
-            search_query: String::new(),
-            search_results: Vec::new(),
-            playlists: Vec::new(),
-            selected_playlist_idx: None,
-            selected_playlist_tracks: Vec::new(),
-            new_playlist_input: String::new(),
-            rename_playlist_id: None,
-            rename_playlist_input: String::new(),
-            marked_track_ids: HashSet::new(),
-            pinned_tracks: Vec::new(),
-            playlist_picker: None,
-            torrent_query: String::new(),
-            torrent_magnet_input: String::new(),
-            jackett_url_input,
-            torrent_searching: false,
-            torrent_search_ticks: 0.0,
-            torrent_search_logs: Vec::new(),
-            torrent_results: Vec::new(),
-            pending_magnets: Vec::new(),
-            pending_queued_uris: Vec::new(),
-            active_torrents: Vec::new(),
-            synced_torrent_hashes: HashSet::new(),
-            node_identity,
-            p2p_server: None,
-            p2p_client,
-            paired_peers,
-            peer_tracks: Vec::new(),
-            peer_connect_input: String::new(),
-            p2p_logs: Vec::new(),
-            pending_peer_downloads: HashMap::new(),
-            cache_stats,
-            status_message: String::new(),
-            watcher_slot,
-        };
-        st.refresh_from_db()?;
         Ok(st)
     }
 
@@ -598,6 +613,29 @@ impl GuiState {
                         }
                     }
                 }
+                WebRemoteCommand::EnqueueTrack { track_id } => {
+                    let fetched = self
+                        .db
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.get_track(track_id).ok().flatten());
+                    if let Some(tr) = fetched {
+                        let _ = self.enqueue_tracks(std::slice::from_ref(&tr));
+                    }
+                }
+                WebRemoteCommand::EnqueueTracks { track_ids } => {
+                    let mut fetched = Vec::new();
+                    if let Ok(guard) = self.db.lock() {
+                        for id in track_ids {
+                            if let Ok(Some(tr)) = guard.get_track(id) {
+                                fetched.push(tr);
+                            }
+                        }
+                    }
+                    if !fetched.is_empty() {
+                        let _ = self.enqueue_tracks(&fetched);
+                    }
+                }
                 WebRemoteCommand::TogglePause => {
                     let _ = self.player.toggle_pause();
                 }
@@ -794,6 +832,16 @@ impl GuiState {
         if self.marked_track_ids.is_empty() {
             return;
         }
+        let tracks = self.collect_marked_tracks();
+        if !tracks.is_empty() {
+            self.playlist_picker = Some(PlaylistPickerModal {
+                tracks,
+                new_name: String::new(),
+            });
+        }
+    }
+
+    fn collect_marked_tracks(&self) -> Vec<Track> {
         let mut by_id = HashMap::new();
         for list in [
             &self.tracks,
@@ -817,13 +865,46 @@ impl GuiState {
                 }
             }
         }
-        let tracks: Vec<Track> = by_id.into_values().collect();
-        if !tracks.is_empty() {
-            self.playlist_picker = Some(PlaylistPickerModal {
-                tracks,
-                new_name: String::new(),
-            });
+        by_id.into_values().collect()
+    }
+
+    pub fn enqueue_tracks(&mut self, tracks: &[Track]) -> Result<()> {
+        if tracks.is_empty() {
+            return Ok(());
         }
+        let should_start =
+            self.queue.is_empty() || self.player.status().state == PlaybackState::Stopped;
+        let start_idx = self.queue.len();
+        self.queue.enqueue_many(tracks.iter().cloned());
+        if should_start {
+            let target_idx = if start_idx < self.queue.len() {
+                start_idx
+            } else {
+                0
+            };
+            self.queue.jump_to(target_idx);
+            self.play_current_in_queue()?;
+        } else {
+            let _ = self
+                .player
+                .set_prefetch(self.queue.peek_next_for_prefetch().cloned());
+        }
+        let total = self.queue.len();
+        self.status_message = if tracks.len() == 1 {
+            self.i18n.added_to_queue(&tracks[0].title, total)
+        } else {
+            self.i18n.added_multiple_to_queue(tracks.len(), total)
+        };
+        self.marked_track_ids.clear();
+        Ok(())
+    }
+
+    pub fn enqueue_marked_tracks(&mut self) -> Result<()> {
+        if self.marked_track_ids.is_empty() {
+            return Ok(());
+        }
+        let tracks = self.collect_marked_tracks();
+        self.enqueue_tracks(&tracks)
     }
 
     pub fn add_tracks_to_playlist(

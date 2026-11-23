@@ -90,16 +90,45 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     match app.active_tab {
         Tab::Library => {
+            let filtered = app.filtered_library_tracks();
+            let show_filter_bar = app.library_filtering || !app.library_filter.is_empty();
+            let table_area = if show_filter_bar {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(5)])
+                    .split(root[3]);
+                let cursor = if app.library_filtering { "█" } else { "" };
+                let border_style = if app.library_filtering {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                let filter_widget = Paragraph::new(format!(
+                    "[f] Filtro / Filter: {}{cursor}   ([Esc]: Limpiar / Clear)",
+                    app.library_filter
+                ))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(border_style)
+                        .title(format!(" {} ", app.i18n.tab_library())),
+                );
+                frame.render_widget(filter_widget, chunks[0]);
+                chunks[1]
+            } else {
+                root[3]
+            };
+
             let mut l = app.layout.borrow_mut();
-            l.library_table = root[3];
+            l.library_table = table_area;
             drop(l);
             let scroll = draw_track_table(
                 frame,
                 app,
-                &app.tracks,
+                &filtered,
                 app.library_selected,
-                &format!("{} ([a]: +Playlist | [p]: Pin)", app.i18n.tab_library()),
-                root[3],
+                &format!("{} ([f]: Filtro | [x]: Marcar | [a]: +Playlist | [p]: Pin)", app.i18n.tab_library()),
+                table_area,
                 true,
             );
             app.layout.borrow_mut().library_scroll = scroll;
@@ -118,6 +147,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_playlist_picker_modal(frame, app);
     } else if app.show_qr_modal {
         draw_qr_modal(frame, app);
+    } else if app.show_help_modal {
+        draw_help_modal(frame, app);
     }
 }
 
@@ -152,8 +183,22 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Magenta),
         ),
     ]);
-    let block = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
+    let help_pill = format!(" [{}] ", app.i18n.help_btn_label());
+    let help_w = help_pill.chars().count() as u16;
+    let block = Paragraph::new(line).block(
+        Block::default().borders(Borders::ALL).title_top(
+            Line::from(Span::styled(
+                help_pill,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .right_aligned(),
+        ),
+    );
     frame.render_widget(block, area);
+    let help_x = area.x + area.width.saturating_sub(help_w + 1);
+    app.layout.borrow_mut().help_btn = Rect::new(help_x, area.y, help_w, 1);
 }
 
 fn draw_scan_banner(frame: &mut Frame, app: &App, area: Rect) {
@@ -231,6 +276,7 @@ fn draw_track_table(
         Cell::from(app.i18n.col_title()),
         Cell::from(app.i18n.col_artist()),
         Cell::from(app.i18n.col_album()),
+        Cell::from(app.i18n.col_duration()),
         Cell::from(app.i18n.col_format()),
     ])
     .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
@@ -254,6 +300,10 @@ fn draw_track_table(
                 (true, false) => "✓ ",
                 (false, true) => " ★",
                 (false, false) => "  ",
+            };
+            let dur_cell = match t.duration_secs {
+                Some(s) if s > 0 => format!("{:02}:{:02}", s / 60, s % 60),
+                _ => "--:--".to_string(),
             };
             let fmt_cell = match &t.source {
                 TrackSource::Peer { cached_path, .. } => {
@@ -286,6 +336,7 @@ fn draw_track_table(
                 Cell::from(t.title.clone()),
                 Cell::from(t.artist.clone()),
                 Cell::from(t.album.clone()),
+                Cell::from(dur_cell),
                 Cell::from(fmt_cell),
             ])
             .style(style)
@@ -302,14 +353,20 @@ fn draw_track_table(
     } else {
         format!(" {}", app.i18n.marked_tracks_badge(app.marked_track_ids.len()))
     };
+    let count_badge = if tracks.is_empty() {
+        "0".to_string()
+    } else {
+        format!("{}/{}", selected.min(tracks.len() - 1) + 1, tracks.len())
+    };
 
     let table = Table::new(
         rows,
         [
             Constraint::Length(5),
-            Constraint::Percentage(35),
-            Constraint::Percentage(26),
-            Constraint::Percentage(26),
+            Constraint::Percentage(33),
+            Constraint::Percentage(24),
+            Constraint::Percentage(24),
+            Constraint::Length(6),
             Constraint::Length(8),
         ],
     )
@@ -318,7 +375,7 @@ fn draw_track_table(
         Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
-            .title(format!(" {title} ({}){marked_suffix} ", tracks.len())),
+            .title(format!(" {title} [{count_badge}]{marked_suffix} ")),
     );
     frame.render_widget(table, area);
     start
@@ -755,11 +812,18 @@ fn draw_player_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     let auto_lbl = app.i18n.auto_next_label(app.auto_next);
     let add_pl_lbl = "[+ Playlist (a)]";
+    let enqueue_lbl = format!("[{} (w)]", app.i18n.enqueue_btn());
+    let queue_str = if app.queue.is_empty() {
+        String::new()
+    } else {
+        let cur = app.queue.current_index().map(|idx| idx + 1).unwrap_or(0);
+        format!(" | {}", app.i18n.queue_badge(cur, app.queue.len()))
+    };
     let title_str = format!(
-        " {state_label} | Vol: {:.0}% ",
+        " {state_label} | Vol: {:.0}%{queue_str} ",
         st.volume * 100.0
     );
-    let right_pills = format!(" {add_pl_lbl} | {auto_lbl} ");
+    let right_pills = format!(" {enqueue_lbl} | {add_pl_lbl} | {auto_lbl} ");
 
     frame.render_widget(
         Block::default()
@@ -791,6 +855,9 @@ fn draw_player_bar(frame: &mut Frame, app: &App, area: Rect) {
     let add_w = add_pl_lbl.chars().count() as u16 + 1;
     let add_x = auto_x.saturating_sub(add_w + 2);
     l.add_playlist_btn = Rect::new(add_x, area.y, add_w, 1);
+    let enq_w = enqueue_lbl.chars().count() as u16 + 1;
+    let enq_x = add_x.saturating_sub(enq_w + 2);
+    l.enqueue_btn = Rect::new(enq_x, area.y, enq_w, 1);
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -1141,4 +1208,85 @@ fn draw_qr_modal(frame: &mut Frame, app: &App) {
     );
 
     app.layout.borrow_mut().qr_modal_box = modal_area;
+}
+
+fn draw_help_modal(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(10),
+            Constraint::Percentage(80),
+            Constraint::Percentage(10),
+        ])
+        .split(area);
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(10),
+            Constraint::Percentage(80),
+            Constraint::Percentage(10),
+        ])
+        .split(v[1]);
+    let modal_area = h[1];
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .title(format!(" {} ", app.i18n.help_modal_title()));
+    frame.render_widget(block, modal_area);
+
+    let sections = app.i18n.help_modal_sections();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(46),
+            Constraint::Percentage(46),
+            Constraint::Length(1),
+        ])
+        .margin(1)
+        .split(modal_area);
+
+    for (r_idx, row_rect) in [rows[0], rows[1]].iter().enumerate() {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(*row_rect);
+        for (c_idx, col_rect) in cols.iter().enumerate() {
+            let sec_idx = r_idx * 2 + c_idx;
+            if let Some((sec_title, items)) = sections.get(sec_idx) {
+                let lines: Vec<Line> = items
+                    .iter()
+                    .map(|(k, desc)| {
+                        Line::from(vec![
+                            Span::styled(
+                                format!("[{k}] "),
+                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(*desc),
+                        ])
+                    })
+                    .collect();
+                let card = Paragraph::new(lines)
+                    .wrap(Wrap { trim: true })
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan))
+                            .title(format!(" {sec_title} ")),
+                    );
+                frame.render_widget(card, *col_rect);
+            }
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!("[Esc / ? / F1]: {}", app.i18n.cancel_btn()),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
 }

@@ -27,6 +27,27 @@ impl PlaybackQueue {
         }
     }
 
+    pub fn enqueue_many(&mut self, tracks: impl IntoIterator<Item = Track>) -> usize {
+        let mut added = 0usize;
+        for track in tracks {
+            self.items.push(track);
+            added += 1;
+        }
+        if self.current_index.is_none() && !self.items.is_empty() {
+            self.current_index = Some(0);
+        }
+        added
+    }
+
+    pub fn jump_to(&mut self, index: usize) -> Option<&Track> {
+        if index < self.items.len() {
+            self.current_index = Some(index);
+            self.current()
+        } else {
+            None
+        }
+    }
+
     pub fn play_now(&mut self, track: Track) {
         if let Some(pos) = self.items.iter().position(|t| t.id == track.id && track.id != 0) {
             self.current_index = Some(pos);

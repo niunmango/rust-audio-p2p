@@ -333,8 +333,18 @@ fn handle_mouse(
         return Ok(());
     }
 
+    if app.show_help_modal {
+        app.show_help_modal = false;
+        return Ok(());
+    }
+
     if app.show_qr_modal {
         app.show_qr_modal = false;
+        return Ok(());
+    }
+
+    if point_in(layout.help_btn, col, row) {
+        app.show_help_modal = !app.show_help_modal;
         return Ok(());
     }
 
@@ -347,6 +357,10 @@ fn handle_mouse(
     }
 
     // 3. Player bar clicks
+    if point_in(layout.enqueue_btn, col, row) {
+        app.enqueue_selected_or_marked()?;
+        return Ok(());
+    }
     if point_in(layout.add_playlist_btn, col, row) {
         app.open_playlist_picker_for_selected();
         return Ok(());
@@ -375,7 +389,8 @@ fn handle_mouse(
         Tab::Library => {
             if point_in(layout.library_table, col, row) && row >= layout.library_table.y + 2 {
                 let idx = layout.library_scroll + (row - (layout.library_table.y + 2)) as usize;
-                if idx < app.tracks.len() {
+                let lib_len = app.filtered_library_tracks().len();
+                if idx < lib_len {
                     let already = app.library_selected == idx;
                     app.library_selected = idx;
                     if is_double_click || already {
@@ -507,11 +522,7 @@ fn handle_mouse(
 
 fn handle_tab_hotkeys(app: &mut App, key: &KeyEvent) -> bool {
     match key.code {
-        KeyCode::F(1) => {
-            app.switch_tab(Tab::Library);
-            true
-        }
-        KeyCode::F(2) => {
+        KeyCode::F(2) if app.active_tab != Tab::Playlists => {
             app.switch_tab(Tab::Search);
             true
         }
@@ -543,6 +554,21 @@ fn handle_tab_hotkeys(app: &mut App, key: &KeyEvent) -> bool {
 fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.should_quit = true;
+        return Ok(());
+    }
+
+    if key.code == KeyCode::F(1) {
+        app.show_help_modal = !app.show_help_modal;
+        return Ok(());
+    }
+
+    if app.show_help_modal {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::Char('q') => {
+                app.show_help_modal = false;
+            }
+            _ => {}
+        }
         return Ok(());
     }
 
@@ -604,10 +630,40 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
-    // 2. Search input editing (allows live typing + Up/Down navigation + Enter to play)
+    // 2. Quick Library Filter typing
+    if app.library_filtering && app.active_tab == Tab::Library {
+        match key.code {
+            KeyCode::Esc => {
+                app.library_filter.clear();
+                app.library_filtering = false;
+                app.library_selected = 0;
+            }
+            KeyCode::Enter => {
+                app.library_filtering = false;
+            }
+            KeyCode::Up => move_selection(app, -1)?,
+            KeyCode::Down => move_selection(app, 1)?,
+            KeyCode::Backspace => {
+                app.library_filter.pop();
+                app.library_selected = 0;
+            }
+            KeyCode::Char(c) => {
+                app.library_filter.push(c);
+                app.library_selected = 0;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // 2b. Search input editing (allows live typing + Up/Down navigation + Enter to play)
     if app.search_editing && app.active_tab == Tab::Search {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
             app.open_playlist_picker_for_selected();
+            return Ok(());
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w') {
+            app.enqueue_selected_or_marked()?;
             return Ok(());
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
@@ -724,6 +780,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // 5. Global navigation and playback shortcuts
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('?') => app.show_help_modal = !app.show_help_modal,
+        KeyCode::Char('f') if app.active_tab == Tab::Library => {
+            app.library_filtering = true;
+            app.library_selected = 0;
+        }
         KeyCode::Char('1') => app.switch_tab(Tab::Library),
         KeyCode::Char('2') => app.switch_tab(Tab::Search),
         KeyCode::Char('3') => app.switch_tab(Tab::Playlists),
@@ -765,6 +826,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('p') => app.toggle_pin_selected()?,
         KeyCode::Char('x') => app.toggle_mark_selected_track(),
         KeyCode::Char('X') => app.clear_marked_tracks(),
+        KeyCode::Char('w') => app.enqueue_selected_or_marked()?,
         KeyCode::Char('a') => app.open_playlist_picker_for_selected(),
         KeyCode::Char('e') | KeyCode::F(2) if app.active_tab == Tab::Playlists => {
             app.start_renaming_selected_playlist();
@@ -828,7 +890,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 fn move_selection(app: &mut App, delta: isize) -> Result<()> {
     match app.active_tab {
         Tab::Library => {
-            let len = app.tracks.len();
+            let len = app.filtered_library_tracks().len();
             if len > 0 {
                 app.library_selected = (app.library_selected as isize + delta).clamp(0, len as isize - 1) as usize;
             }
@@ -1261,6 +1323,40 @@ mod tests {
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)).unwrap();
         assert!(app.playlists.is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_base);
+    }
+
+    #[test]
+    fn test_tui_help_modal_and_library_filter() {
+        let (mut app, temp_base) = make_test_app();
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+
+        // Toggle Help Modal with '?' and render
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)).unwrap();
+        assert!(app.show_help_modal);
+        terminal.draw(|f| ui::draw(f, &app)).unwrap();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(!app.show_help_modal);
+
+        // Quick Library filter with 'f'
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)).unwrap();
+        assert!(app.library_filtering);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE)).unwrap();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.filtered_library_tracks().len(), 1);
+        assert_eq!(app.filtered_library_tracks()[0].title, "Beta");
+        terminal.draw(|f| ui::draw(f, &app)).unwrap();
+
+        // Mark both tracks and press 'w' to enqueue into playback queue
+        app.switch_tab(Tab::Library);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        app.library_filter.clear();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)).unwrap();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)).unwrap();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.queue.len(), 2);
+        assert!(app.marked_track_ids.is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_base);
     }
