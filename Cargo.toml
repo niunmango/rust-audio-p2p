@@ -6,6 +6,7 @@ members = [
     "crates/source-torrent",
     "crates/net-friends",
     "crates/player",
+    "crates/android-ffi",
     "bins/tui",
     "bins/gui",
 ]
