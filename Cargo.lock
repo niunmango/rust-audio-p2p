@@ -4010,6 +4010,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-audio-android-ffi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rust-audio-core",
+ "rust-audio-net-friends",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rust-audio-core"
 version = "0.1.0"
 dependencies = [
