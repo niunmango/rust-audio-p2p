@@ -30,6 +30,7 @@ data class NetworkBatteryPolicy(
 object RustAudioBridge {
     init {
         System.loadLibrary("rust_audio_android_ffi")
+        System.loadLibrary("rust_audio_android_jni")
     }
 
     external fun invokeJson(requestJson: String): String

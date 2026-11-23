@@ -1,6 +1,10 @@
 package io.github.niunmango.rustaudiop2p
 
+import android.annotation.SuppressLint
 import android.os.Bundle
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
@@ -10,6 +14,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -41,6 +46,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun RustAudioAndroidScreen(
     filesDirPath: String,
@@ -50,28 +56,30 @@ fun RustAudioAndroidScreen(
     onDetectPolicy: (Boolean, Boolean) -> NetworkBatteryPolicy,
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
+    var nodeUrlInput by remember { mutableStateOf("http://192.168.1.200:4261") }
+    var activeNodeUrl by remember { mutableStateOf("http://192.168.1.200:4261") }
     var searchQuery by remember { mutableStateOf("") }
     var peerTicket by remember { mutableStateOf("") }
     var wifiOnlySync by remember { mutableStateOf(true) }
     var chargingOnlySeed by remember { mutableStateOf(true) }
-    var statusText by remember { mutableStateOf("Node: $initialStatus") }
+    var statusText by remember { mutableStateOf("Rust Core: $initialStatus") }
 
     val tabs = if (isSpanish) {
-        listOf("Biblioteca", "Playlists & Viaje", "Red P2P", "Batería/Red")
+        listOf("Reproductor LAN", "FTS5 Local", "Red P2P", "Batería/Red")
     } else {
-        listOf("Library", "Playlists & Travel", "P2P Net", "Battery/Net")
+        listOf("LAN Player", "Local FTS5", "P2P Net", "Battery/Net")
     }
 
     Scaffold(
         topBar = {
             Column {
                 Text(
-                    text = "rust-audio-p2p Mobile",
+                    text = "rust-audio-p2p Android",
                     style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(14.dp),
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                 )
-                TabRow(selectedTabIndex = selectedTab) {
+                ScrollableTabRow(selectedTabIndex = selectedTab) {
                     tabs.forEachIndexed { idx, label ->
                         Tab(
                             selected = selectedTab == idx,
@@ -87,13 +95,54 @@ fun RustAudioAndroidScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(12.dp)
+                .padding(8.dp)
         ) {
-            Text(statusText, color = MaterialTheme.colorScheme.secondary)
-            Spacer(Modifier.height(10.dp))
-
             when (selectedTab) {
                 0 -> {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        OutlinedTextField(
+                            value = nodeUrlInput,
+                            onValueChange = { nodeUrlInput = it },
+                            label = { Text(if (isSpanish) "Nodo LAN (ej. 192.168.1.200:4261)" else "LAN Node URL") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Button(
+                            onClick = {
+                                val trimmed = nodeUrlInput.trim()
+                                activeNodeUrl = if (trimmed.startsWith("http")) trimmed else "http://$trimmed"
+                            },
+                            modifier = Modifier.padding(top = 8.dp),
+                        ) {
+                            Text(if (isSpanish) "Ir" else "Go")
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize().weight(1f),
+                        factory = { ctx ->
+                            WebView(ctx).apply {
+                                settings.javaScriptEnabled = true
+                                settings.domStorageEnabled = true
+                                settings.mediaPlaybackRequiresUserGesture = false
+                                webViewClient = WebViewClient()
+                                webChromeClient = WebChromeClient()
+                                loadUrl(activeNodeUrl)
+                            }
+                        },
+                        update = { webView ->
+                            if (webView.url != activeNodeUrl) {
+                                webView.loadUrl(activeNodeUrl)
+                            }
+                        },
+                    )
+                }
+                1 -> {
+                    Text(statusText, color = MaterialTheme.colorScheme.secondary)
+                    Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
                         value = searchQuery,
                         onValueChange = {
@@ -103,28 +152,23 @@ fun RustAudioAndroidScreen(
                             }.getOrNull()
                             statusText = res?.toString() ?: statusText
                         },
-                        label = { Text(if (isSpanish) "Buscar (FTS5)" else "Search (FTS5)") },
+                        label = { Text(if (isSpanish) "Buscar (FTS5 Rust Core)" else "Search (FTS5 Rust Core)") },
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Spacer(Modifier.height(8.dp))
                     LazyColumn(modifier = Modifier.weight(1f)) {
                         item {
                             Text(
-                                if (isSpanish) "Sincronizá tu biblioteca Linux por Wi-Fi o pines de viaje."
-                                else "Sync your Linux library over Wi-Fi or travel pins.",
+                                if (isSpanish) "Core SQLite + FTS5 y políticas offline activas en $filesDirPath"
+                                else "SQLite + FTS5 core & offline cache active at $filesDirPath",
                                 color = Color.LightGray,
                             )
                         }
                     }
                 }
-                1 -> {
-                    Text(
-                        if (isSpanish) "Playlists y Pines Offline para Modo Viaje"
-                        else "Playlists & Offline Travel Pins",
-                        style = MaterialTheme.typography.titleMedium,
-                    )
-                }
                 2 -> {
+                    Text(statusText, color = MaterialTheme.colorScheme.secondary)
+                    Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
                         value = peerTicket,
                         onValueChange = { peerTicket = it },
@@ -137,8 +181,10 @@ fun RustAudioAndroidScreen(
                     }
                 }
                 3 -> {
+                    Text(statusText, color = MaterialTheme.colorScheme.secondary)
+                    Spacer(Modifier.height(10.dp))
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(if (isSpanish) "Descargar/Sincronizar en lote solo con Wi-Fi" else "Batch download/sync on Wi-Fi only")
+                        Text(if (isSpanish) "Sincronizar / descargar solo con Wi-Fi" else "Sync / download on Wi-Fi only")
                         Switch(
                             checked = wifiOnlySync,
                             onCheckedChange = {
@@ -150,7 +196,7 @@ fun RustAudioAndroidScreen(
                     }
                     Spacer(Modifier.height(8.dp))
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(if (isSpanish) "Compartir/Seedear solo cargando batería" else "Share/Seed only while charging")
+                        Text(if (isSpanish) "Seedear P2P solo cargando batería" else "Seed P2P only while charging")
                         Switch(
                             checked = chargingOnlySeed,
                             onCheckedChange = {
