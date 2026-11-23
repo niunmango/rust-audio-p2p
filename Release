@@ -1,23 +1,23 @@
 Architectures: amd64
 Codename: ./
 Components: main
-Date: Mon, 23 Nov 2026 01:16:08 +0000
+Date: Mon, 23 Nov 2026 01:41:15 +0000
 Label: rust-audio-p2p
 Origin: niunmango
 Suite: stable
 MD5Sum:
- 2089f4da6ba4c1d82be7a12abc20ddf0              819 Packages
- 17dfa8eac4a0f4b848465888d5e7808c              582 Packages.gz
- a2ee9cd74182611186b838d17ea0388e              143 Release
+ 01d30864423769a26e2c3ae3a52b13ca              819 Packages
+ ce874af1ecc6489eead267198eeb7f12              583 Packages.gz
+ 3126307795515a5d212d869827d49e8e              143 Release
 SHA1:
- e1afd24fb7deeb503f26a5cf7a2123b2790e8830              819 Packages
- 4945c5f2f2b05d29becfa02c93909f11af70a3cc              582 Packages.gz
- 865f8c8d337139e7b52831239fa465396624538f              143 Release
+ df813c38725b43040b8998ccd4edb71d28d3b971              819 Packages
+ c6a826efbc67f44e2bd3a4373d8a432be00c0f8e              583 Packages.gz
+ 4a6ad376d83166c50d5f7f97d8ec72dbe59262b2              143 Release
 SHA256:
- 2b23f07f5af8349169e4279ea93faa4e661b15e232bd032dd2a42e43a8ce1ebb              819 Packages
- 005c13e467fbef8671aee8db50bdf502b10555c05c0cddc05ab46c06362d88d3              582 Packages.gz
- 7dbaeded4693f22dc52f6bf7b8e72b75e76d31d2ddbeab477176ffe53066bc7e              143 Release
+ d97133a26eb636f4a7dd7bdbfe6ee0fc699349d02366ed6022b28ac6d949c65e              819 Packages
+ b86f4bd5904f7c391cc3ffd8c26f6776260620a45bcb93a9abd546ba5833617a              583 Packages.gz
+ 71a5dab6266276e90d2465b93567751fb953d1d9898717244107814270b2c987              143 Release
 SHA512:
- 9e2a6605e3dcc8eedf454b97d0516334d459a5195536e81982a259e07858444f929454b4df2c18ec70164c278adbc3c2f254b89ef713610d8e033dd7aa9b5e4f              819 Packages
- ec6fc3346146f0a75a861130573ee6e34943b8bd296c4e77b1d0a3da0b67c697edbb06e6c49a2bdc59bea09a6aa91ae961c3de9c9d8c51aa06ea0755f7f100f7              582 Packages.gz
- 4caafe9ab71490152bf9e78651ad9975b5deb193146cefcebaaadf9fb08fca3e1b221c545981c8642449c26122bfcc88b3a62dada8c013298990b1fe9af0df9a              143 Release
+ afd76dbf1ffc53eb676c26b342896535a8c53904291f2557e566e1dd4a411e42992a5acaf94987ddf16ad0307a3324699e4942e4182730e41f39318124358b2b              819 Packages
+ f143c848b02b354958f5cb2004e28682588ab8228a8e59e21d46620daa3f830a79be2fb77c7199488740c74b557ecf9fdf37590c13492c8a48c4346a2fc0ad2a              583 Packages.gz
+ 8ef27246774a9619f5825739fc4138c6244b2a04f775d62f5121aba0fc7ba22c110d37e865217122e3fd19412ee1b279d18247a1146e1efd4e3663515697cc74              143 Release
