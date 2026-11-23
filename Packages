@@ -1,14 +1,14 @@
 Package: rust-audio-p2p
-Version: 0.1.9
+Version: 0.1.10
 Architecture: amd64
 Maintainer: niunmango <niunmango@yahoo.com>
 Installed-Size: 39408
 Depends: libc6, libasound2t64 | libasound2, libxkbcommon0, libxkbcommon-x11-0, libgl1
-Filename: ./rust-audio-p2p_0.1.9_amd64.deb
-Size: 13044774
-MD5sum: 60bf1bbe70ee134e510cde6bc1b84dc5
-SHA1: 323744d01ca5c8b643599e8cc24ae2143a598c45
-SHA256: 2b9e3b9bc5b65997264d8f9fac2eb8218096fd3fb158edc326fe02d0da2215f2
+Filename: ./rust-audio-p2p_0.1.10_amd64.deb
+Size: 13044760
+MD5sum: 791b58812494b364b27c5acb24af0b56
+SHA1: c67484f5630abde53ccc558812d982468968781f
+SHA256: 03f4696473839b38d1a44b917fd739b3552f8e6eea5e62e0fb94f296b3f3fc3e
 Section: sound
 Priority: optional
 Homepage: https://github.com/niunmango/rust-audio-p2p
