@@ -23,6 +23,11 @@ const EXCLUDED_DIRS: &[&str] = &[
     "__pycache__",
     "dist",
     "build",
+    "AppData",
+    "Library",
+    "Applications",
+    "$RECYCLE.BIN",
+    "System Volume Information",
 ];
 const COVER_FILENAMES: &[&str] = &["cover.jpg", "cover.png", "folder.jpg", "folder.png", "artist.jpg"];
 
@@ -429,6 +434,9 @@ mod tests {
         assert!(is_supported_audio(Path::new("/tmp/song.mp3")));
         assert!(!is_supported_audio(Path::new("/tmp/movie.mkv")));
         assert!(!is_supported_audio(Path::new("/tmp/cover.jpg")));
+        assert!(EXCLUDED_DIRS.contains(&"AppData"));
+        assert!(EXCLUDED_DIRS.contains(&"Library"));
+        assert!(EXCLUDED_DIRS.contains(&"Applications"));
     }
 
     #[test]

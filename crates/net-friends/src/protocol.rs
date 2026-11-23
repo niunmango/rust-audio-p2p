@@ -99,9 +99,9 @@ fn detect_hostname() -> String {
     "rust-audio-node".to_string()
 }
 
-fn random_hex(num_bytes: usize) -> String {
+pub fn random_hex(num_bytes: usize) -> String {
     let mut buf = vec![0u8; num_bytes];
-    read_urandom(&mut buf).expect("OS CSPRNG /dev/urandom unavailable");
+    fill_random_bytes(&mut buf);
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -113,10 +113,31 @@ pub fn sanitize_display_text(input: &str) -> String {
         .collect()
 }
 
-fn read_urandom(buf: &mut [u8]) -> std::io::Result<()> {
+#[cfg(unix)]
+fn fill_random_bytes(buf: &mut [u8]) {
     use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom")?;
+    let mut f = std::fs::File::open("/dev/urandom").expect("OS CSPRNG /dev/urandom unavailable");
     f.read_exact(buf)
+        .expect("Failed reading random bytes from /dev/urandom");
+}
+
+#[cfg(not(unix))]
+fn fill_random_bytes(buf: &mut [u8]) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15);
+    let pid = std::process::id() as u64;
+    let stack_probe = buf.as_ptr() as usize as u64;
+    let mut state = nanos ^ pid.rotate_left(17) ^ stack_probe.rotate_left(7);
+    for b in buf.iter_mut() {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        *b = (z & 0xff) as u8;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,4 +595,19 @@ fn percent_decode(input: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&raw_out).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::random_hex;
+
+    #[test]
+    fn test_random_hex_length_and_uniqueness() {
+        let a = random_hex(16);
+        let b = random_hex(16);
+        assert_eq!(a.len(), 32);
+        assert_eq!(b.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
 }
