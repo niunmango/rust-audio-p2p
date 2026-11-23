@@ -45,6 +45,8 @@ impl Database {
         self.conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS tracks (
@@ -83,7 +85,10 @@ impl Database {
                 VALUES ('delete', old.id, old.title, old.artist, old.album);
             END;
 
-            CREATE TRIGGER IF NOT EXISTS tracks_au AFTER UPDATE ON tracks BEGIN
+            DROP TRIGGER IF EXISTS tracks_au;
+            CREATE TRIGGER tracks_au AFTER UPDATE OF title, artist, album ON tracks
+            WHEN old.title IS NOT new.title OR old.artist IS NOT new.artist OR old.album IS NOT new.album
+            BEGIN
                 INSERT INTO tracks_fts(tracks_fts, rowid, title, artist, album)
                 VALUES ('delete', old.id, old.title, old.artist, old.album);
                 INSERT INTO tracks_fts(rowid, title, artist, album)
@@ -144,30 +149,69 @@ impl Database {
     }
 
     pub fn upsert_track(&self, track: &Track) -> Result<i64> {
+        struct ExistingTrackRow {
+            id: i64,
+            source_type: String,
+            source_json: String,
+            title: String,
+            artist: String,
+            album: String,
+            year: Option<i32>,
+            track_number: Option<u32>,
+            duration_secs: Option<i64>,
+            file_size_bytes: i64,
+            format: String,
+            cover_path: Option<String>,
+        }
+
         let source_key = track.source.unique_key();
         let source_type = track.source.source_type();
-        let mut effective_source: Cow<'_, TrackSource> = Cow::Borrowed(&track.source);
+        let duration_i64 = track.duration_secs.map(|d| d as i64);
+        let file_size_i64 = track.file_size_bytes as i64;
+        let now = now_unix();
 
-        if let TrackSource::Peer {
-            node_id,
-            node_name,
-            remote_track_id,
-            cached_path: None,
-        } = &track.source
-        {
-            if let Ok(Some(existing_json)) = self
-                .conn
-                .query_row(
-                    "SELECT source_json FROM tracks WHERE source_key = ?1",
-                    params![&source_key],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
+        let existing = self
+            .conn
+            .query_row(
+                r#"
+                SELECT id, source_type, source_json, title, artist, album,
+                       year, track_number, duration_secs, file_size_bytes, format, cover_path
+                FROM tracks
+                WHERE source_key = ?1
+                "#,
+                params![&source_key],
+                |row| {
+                    Ok(ExistingTrackRow {
+                        id: row.get(0)?,
+                        source_type: row.get(1)?,
+                        source_json: row.get(2)?,
+                        title: row.get(3)?,
+                        artist: row.get(4)?,
+                        album: row.get(5)?,
+                        year: row.get(6)?,
+                        track_number: row.get(7)?,
+                        duration_secs: row.get(8)?,
+                        file_size_bytes: row.get(9)?,
+                        format: row.get(10)?,
+                        cover_path: row.get(11)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        if let Some(existing) = existing {
+            let mut effective_source: Cow<'_, TrackSource> = Cow::Borrowed(&track.source);
+            if let TrackSource::Peer {
+                node_id,
+                node_name,
+                remote_track_id,
+                cached_path: None,
+            } = &track.source
             {
                 if let Ok(TrackSource::Peer {
                     cached_path: Some(existing_path),
                     ..
-                }) = serde_json::from_str::<TrackSource>(&existing_json)
+                }) = serde_json::from_str::<TrackSource>(&existing.source_json)
                 {
                     if Path::new(&existing_path).exists() {
                         effective_source = Cow::Owned(TrackSource::Peer {
@@ -179,11 +223,60 @@ impl Database {
                     }
                 }
             }
+
+            let source_json = serde_json::to_string(effective_source.as_ref())?;
+            if existing.source_type == source_type
+                && existing.source_json == source_json
+                && existing.title == track.title
+                && existing.artist == track.artist
+                && existing.album == track.album
+                && existing.year == track.year
+                && existing.track_number == track.track_number
+                && existing.duration_secs == duration_i64
+                && existing.file_size_bytes == file_size_i64
+                && existing.format == track.format
+                && existing.cover_path == track.cover_path
+            {
+                return Ok(existing.id);
+            }
+
+            self.conn.execute(
+                r#"
+                UPDATE tracks SET
+                    source_type = ?1,
+                    source_json = ?2,
+                    title = ?3,
+                    artist = ?4,
+                    album = ?5,
+                    year = ?6,
+                    track_number = ?7,
+                    duration_secs = ?8,
+                    file_size_bytes = ?9,
+                    format = ?10,
+                    cover_path = ?11,
+                    updated_at = ?12
+                WHERE id = ?13
+                "#,
+                params![
+                    source_type,
+                    source_json,
+                    track.title,
+                    track.artist,
+                    track.album,
+                    track.year,
+                    track.track_number,
+                    duration_i64,
+                    file_size_i64,
+                    track.format,
+                    track.cover_path,
+                    now,
+                    existing.id,
+                ],
+            )?;
+            return Ok(existing.id);
         }
 
-        let source_json = serde_json::to_string(effective_source.as_ref())?;
-        let now = now_unix();
-
+        let source_json = serde_json::to_string(&track.source)?;
         self.conn.execute(
             r#"
             INSERT INTO tracks (
@@ -192,19 +285,6 @@ impl Database {
                 cover_path, pinned, updated_at
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-            ON CONFLICT(source_key) DO UPDATE SET
-                source_type = excluded.source_type,
-                source_json = excluded.source_json,
-                title = excluded.title,
-                artist = excluded.artist,
-                album = excluded.album,
-                year = excluded.year,
-                track_number = excluded.track_number,
-                duration_secs = excluded.duration_secs,
-                file_size_bytes = excluded.file_size_bytes,
-                format = excluded.format,
-                cover_path = excluded.cover_path,
-                updated_at = excluded.updated_at
             "#,
             params![
                 source_key,
@@ -215,8 +295,8 @@ impl Database {
                 track.album,
                 track.year,
                 track.track_number,
-                track.duration_secs.map(|d| d as i64),
-                track.file_size_bytes as i64,
+                duration_i64,
+                file_size_i64,
                 track.format,
                 track.cover_path,
                 if track.pinned { 1 } else { 0 },
@@ -224,12 +304,53 @@ impl Database {
             ],
         )?;
 
-        let id: i64 = self.conn.query_row(
-            "SELECT id FROM tracks WHERE source_key = ?1",
-            params![source_key],
-            |row| row.get(0),
-        )?;
-        Ok(id)
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn upsert_tracks_batch(&self, tracks: &[Track]) -> Result<Vec<i64>> {
+        if tracks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut ids = Vec::with_capacity(tracks.len());
+        for track in tracks {
+            ids.push(self.upsert_track(track)?);
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    pub fn apply_peer_catalog_tx(
+        &self,
+        paired_peers: &[PairedPeer],
+        tracks_with_remote_ids: &[(i64, Track)],
+        playlists: &[(String, Vec<i64>)],
+    ) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.save_paired_peers(paired_peers)?;
+
+        let mut remote_to_local =
+            std::collections::HashMap::with_capacity(tracks_with_remote_ids.len());
+        let mut upserted = 0usize;
+        for (remote_id, track) in tracks_with_remote_ids {
+            if let Ok(local_id) = self.upsert_track(track) {
+                remote_to_local.insert(*remote_id, local_id);
+                upserted += 1;
+            }
+        }
+
+        for (pl_name, remote_track_ids) in playlists {
+            if let Ok(local_pl_id) = self.create_playlist(pl_name) {
+                for remote_tid in remote_track_ids {
+                    if let Some(&local_tid) = remote_to_local.get(remote_tid) {
+                        let _ = self.add_track_to_playlist(local_pl_id, local_tid);
+                    }
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(upserted)
     }
 
     pub fn count_tracks(&self) -> Result<usize> {
@@ -342,6 +463,7 @@ impl Database {
     }
 
     pub fn delete_playlist(&self, playlist_id: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         self.conn.execute(
             "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
             params![playlist_id],
@@ -350,15 +472,18 @@ impl Database {
             "DELETE FROM playlists WHERE id = ?1",
             params![playlist_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn add_tracks_to_playlist(&self, playlist_id: i64, track_ids: &[i64]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
         let mut added = 0usize;
         for &track_id in track_ids {
             self.add_track_to_playlist(playlist_id, track_id)?;
             added += 1;
         }
+        tx.commit()?;
         Ok(added)
     }
 
@@ -857,5 +982,162 @@ mod tests {
         db.delete_playlist(pl_id).unwrap();
         assert!(db.list_playlists().unwrap().is_empty());
         assert!(db.get_playlist_tracks(pl_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_upsert_track_idempotent_no_sequence_burn_and_fts_update() {
+        let db = Database::open_in_memory().unwrap();
+        let mut track = Track {
+            id: 0,
+            title: "Original Song".to_string(),
+            artist: "Band A".to_string(),
+            album: "Album One".to_string(),
+            year: Some(2024),
+            track_number: Some(1),
+            duration_secs: Some(180),
+            file_size_bytes: 12345,
+            format: "flac".to_string(),
+            cover_path: None,
+            source: TrackSource::LocalFile {
+                path: "/tmp/original_song.flac".to_string(),
+            },
+            pinned: false,
+        };
+
+        let id1 = db.upsert_track(&track).unwrap();
+        let seq1: i64 = db
+            .conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'tracks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let updated1: i64 = db
+            .conn
+            .query_row(
+                "SELECT updated_at FROM tracks WHERE id = ?1",
+                params![id1],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        for _ in 0..5 {
+            let id_again = db.upsert_track(&track).unwrap();
+            assert_eq!(id_again, id1);
+        }
+
+        let seq2: i64 = db
+            .conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'tracks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let updated2: i64 = db
+            .conn
+            .query_row(
+                "SELECT updated_at FROM tracks WHERE id = ?1",
+                params![id1],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(seq1, seq2);
+        assert_eq!(updated1, updated2);
+
+        track.title = "Renamed Anthem".to_string();
+        let id_updated = db.upsert_track(&track).unwrap();
+        assert_eq!(id_updated, id1);
+        let seq3: i64 = db
+            .conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'tracks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(seq3, seq1);
+        assert_eq!(db.search_tracks_fts("Renamed", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_batch_upsert_and_peer_catalog_tx() {
+        let temp = std::env::temp_dir().join(format!(
+            "rust_audio_batch_tx_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        let db_path = temp.join("library.db");
+        let db = Database::open(&db_path).unwrap();
+
+        let batch: Vec<Track> = (0..550)
+            .map(|i| Track {
+                id: 0,
+                title: format!("Local Track {i}"),
+                artist: "Local Artist".to_string(),
+                album: "Local Album".to_string(),
+                year: Some(2025),
+                track_number: Some(i as u32 + 1),
+                duration_secs: Some(120),
+                file_size_bytes: 1024 + i as u64,
+                format: "flac".to_string(),
+                cover_path: None,
+                source: TrackSource::LocalFile {
+                    path: format!("/tmp/batch_{i}.flac"),
+                },
+                pinned: false,
+            })
+            .collect();
+        let ids = db.upsert_tracks_batch(&batch).unwrap();
+        assert_eq!(ids.len(), 550);
+
+        let peer = PairedPeer {
+            node_id: "peer1234".to_string(),
+            node_name: "remote-node".to_string(),
+            endpoint: "127.0.0.1:4261".to_string(),
+            auth_token: "token123".to_string(),
+            track_count: 500,
+            playlist_count: 1,
+        };
+        let peer_tracks: Vec<(i64, Track)> = (1..=500)
+            .map(|rid| {
+                (
+                    rid,
+                    Track {
+                        id: 0,
+                        title: format!("Peer Song {rid}"),
+                        artist: "Peer Band".to_string(),
+                        album: "Peer LP".to_string(),
+                        year: Some(2024),
+                        track_number: Some(rid as u32),
+                        duration_secs: Some(200),
+                        file_size_bytes: 2048,
+                        format: "mp3".to_string(),
+                        cover_path: None,
+                        source: TrackSource::Peer {
+                            node_id: "peer1234".to_string(),
+                            node_name: "remote-node".to_string(),
+                            remote_track_id: rid,
+                            cached_path: None,
+                        },
+                        pinned: false,
+                    },
+                )
+            })
+            .collect();
+        let playlists = vec![("[P2P: remote-node] Favs".to_string(), vec![1, 2, 3])];
+        let count = db
+            .apply_peer_catalog_tx(&[peer.clone()], &peer_tracks, &playlists)
+            .unwrap();
+        assert_eq!(count, 500);
+        assert_eq!(db.count_tracks().unwrap(), 1050);
+        assert_eq!(db.load_paired_peers().unwrap(), vec![peer]);
+        let pls = db.list_playlists().unwrap();
+        assert_eq!(pls.len(), 1);
+        assert_eq!(pls[0].track_count, 3);
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

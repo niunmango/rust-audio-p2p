@@ -1,14 +1,16 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::Accessor;
 pub use notify::RecommendedWatcher;
+use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind, RenameMode};
 use notify::{Event, RecursiveMode, Watcher};
 use rust_audio_core::{Database, ScanStatus, Track, TrackSource};
 use tokio::sync::watch;
@@ -28,7 +30,11 @@ const EXCLUDED_DIRS: &[&str] = &[
     "Applications",
     "$RECYCLE.BIN",
     "System Volume Information",
+    "VirtualBox VMs",
+    "__MACOSX",
 ];
+const MAX_WATCHED_DIRS: usize = 2048;
+const MAX_WATCHER_SEEN_CACHE: usize = 50_000;
 const COVER_FILENAMES: &[&str] = &["cover.jpg", "cover.png", "folder.jpg", "folder.png", "artist.jpg"];
 
 pub fn is_supported_audio(path: &Path) -> bool {
@@ -233,6 +239,7 @@ pub fn scan_directory_incremental(
     let mut indexed = 0usize;
     let mut audio_dirs = BTreeSet::new();
     let mut pending_batch: Vec<Track> = Vec::new();
+    let mut last_status_emit = Instant::now();
 
     let walker = WalkDir::new(root)
         .follow_links(false)
@@ -242,7 +249,7 @@ pub fn scan_directory_incremental(
     for entry in walker.flatten() {
         if entry.file_type().is_dir() {
             scanned_dirs += 1;
-            if scanned_dirs % 50 == 0 {
+            if scanned_dirs % 100 == 0 && last_status_emit.elapsed() >= Duration::from_millis(200) {
                 if let Some(tx) = status_tx {
                     let _ = tx.send(ScanStatus::Scanning {
                         root: root_str.clone(),
@@ -251,6 +258,7 @@ pub fn scan_directory_incremental(
                         indexed,
                     });
                 }
+                last_status_emit = Instant::now();
             }
             continue;
         }
@@ -266,7 +274,7 @@ pub fn scan_directory_incremental(
         }
 
         let key = format!("local:{}", path.to_string_lossy());
-        let file_len = std::fs::metadata(path).map(|m| m.len()).ok();
+        let file_len = entry.metadata().map(|m| m.len()).ok();
         if let (Some((prev_len, _)), Some(cur_len)) = (existing.get(&key), file_len) {
             if *prev_len == cur_len {
                 // Already indexed with identical size: skip re-opening with lofty on startup.
@@ -277,19 +285,16 @@ pub fn scan_directory_incremental(
 
         if let Ok(track) = extract_track_metadata(path) {
             pending_batch.push(track);
-            if pending_batch.len() >= 25 {
+            if pending_batch.len() >= 100 {
                 if let Ok(guard) = db.lock() {
-                    for tr in pending_batch.drain(..) {
-                        if guard.upsert_track(&tr).is_ok() {
-                            indexed += 1;
-                        }
+                    if let Ok(ids) = guard.upsert_tracks_batch(&pending_batch) {
+                        indexed += ids.len();
                     }
-                } else {
-                    pending_batch.clear();
                 }
+                pending_batch.clear();
             }
         }
-        if found % 20 == 0 {
+        if found % 25 == 0 && last_status_emit.elapsed() >= Duration::from_millis(200) {
             if let Some(tx) = status_tx {
                 let _ = tx.send(ScanStatus::Scanning {
                     root: root_str.clone(),
@@ -298,17 +303,17 @@ pub fn scan_directory_incremental(
                     indexed,
                 });
             }
+            last_status_emit = Instant::now();
         }
     }
 
     if !pending_batch.is_empty() {
         if let Ok(guard) = db.lock() {
-            for tr in pending_batch.drain(..) {
-                if guard.upsert_track(&tr).is_ok() {
-                    indexed += 1;
-                }
+            if let Ok(ids) = guard.upsert_tracks_batch(&pending_batch) {
+                indexed += ids.len();
             }
         }
+        pending_batch.clear();
     }
 
     if let Some(tx) = status_tx {
@@ -342,20 +347,62 @@ pub fn spawn_home_scan(
     })
 }
 
+pub fn should_process_watcher_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(CreateKind::File | CreateKind::Any)
+            | EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Modify(ModifyKind::Name(
+                RenameMode::To | RenameMode::Both | RenameMode::Any
+            ))
+            | EventKind::Access(AccessKind::Close(AccessMode::Write))
+    )
+}
+
 pub fn start_watcher_for_dirs(
     dirs: &BTreeSet<PathBuf>,
     fallback_root: &Path,
     db: Arc<Mutex<Database>>,
 ) -> Result<RecommendedWatcher> {
+    let mut seen: HashMap<PathBuf, (u64, Option<SystemTime>, Instant)> = HashMap::new();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-        if let Ok(event) = res {
-            for path in event.paths {
-                if is_regular_non_symlink(&path) && is_supported_audio(&path) {
-                    if let Ok(track) = extract_track_metadata(&path) {
-                        if let Ok(guard) = db.lock() {
-                            let _ = guard.upsert_track(&track);
-                        }
-                    }
+        let Ok(event) = res else {
+            return;
+        };
+        if !should_process_watcher_event(&event.kind) {
+            return;
+        }
+        for path in event.paths {
+            if !is_supported_audio(&path) {
+                continue;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !(meta.is_file() && !meta.file_type().is_symlink()) {
+                continue;
+            }
+            let len = meta.len();
+            let mtime = meta.modified().ok();
+            let now = Instant::now();
+            if let Some(&(prev_len, prev_mtime, prev_at)) = seen.get(&path) {
+                if prev_len == len && prev_mtime == mtime {
+                    continue;
+                }
+                if matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))
+                    && now.duration_since(prev_at) < Duration::from_millis(500)
+                {
+                    continue;
+                }
+            }
+            if seen.len() >= MAX_WATCHER_SEEN_CACHE {
+                seen.clear();
+            }
+            seen.insert(path.clone(), (len, mtime, now));
+
+            if let Ok(track) = extract_track_metadata(&path) {
+                if let Ok(guard) = db.lock() {
+                    let _ = guard.upsert_track(&track);
                 }
             }
         }
@@ -366,7 +413,7 @@ pub fn start_watcher_for_dirs(
             let _ = watcher.watch(fallback_root, RecursiveMode::NonRecursive);
         }
     } else {
-        for dir in dirs {
+        for dir in dirs.iter().take(MAX_WATCHED_DIRS) {
             if dir.exists() {
                 let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
             }
@@ -489,5 +536,91 @@ mod tests {
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"56");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_watcher_event_kind_filter() {
+        use notify::event::{DataChange, MetadataKind};
+
+        assert!(!should_process_watcher_event(&EventKind::Access(
+            AccessKind::Open(AccessMode::Any)
+        )));
+        assert!(!should_process_watcher_event(&EventKind::Access(
+            AccessKind::Close(AccessMode::Read)
+        )));
+        assert!(!should_process_watcher_event(&EventKind::Access(
+            AccessKind::Read
+        )));
+        assert!(!should_process_watcher_event(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Any)
+        )));
+
+        assert!(should_process_watcher_event(&EventKind::Create(
+            CreateKind::File
+        )));
+        assert!(should_process_watcher_event(&EventKind::Modify(
+            ModifyKind::Data(DataChange::Any)
+        )));
+        assert!(should_process_watcher_event(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::To)
+        )));
+        assert!(should_process_watcher_event(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::Both)
+        )));
+        assert!(should_process_watcher_event(&EventKind::Access(
+            AccessKind::Close(AccessMode::Write)
+        )));
+    }
+
+    #[test]
+    fn test_watcher_does_not_loop_on_file_open_and_read() {
+        let base = std::env::temp_dir().join(format!(
+            "rust_audio_watcher_noloop_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let music_dir = base.join("Artist/Album");
+        std::fs::create_dir_all(&music_dir).unwrap();
+        let track_path = music_dir.join("01 - Stable Track.flac");
+        std::fs::write(&track_path, b"not-a-real-flac").unwrap();
+
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let (indexed, audio_dirs) = scan_directory_incremental(&base, &db, None).unwrap();
+        assert_eq!(indexed, 1);
+
+        let key = format!("local:{}", track_path.to_string_lossy());
+        let initial_updated_at = db
+            .lock()
+            .unwrap()
+            .get_local_tracks_index()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .1;
+
+        let _watcher = start_watcher_for_dirs(&audio_dirs, &base, Arc::clone(&db)).unwrap();
+
+        for _ in 0..5 {
+            let mut f = File::open(&track_path).unwrap();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+
+        let after_updated_at = db
+            .lock()
+            .unwrap()
+            .get_local_tracks_index()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .1;
+        assert_eq!(after_updated_at, initial_updated_at);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -80,6 +80,11 @@ pub enum AsyncEvent {
         peer: PairedPeer,
         catalog: RemoteCatalogDto,
     },
+    P2pPeerSyncApplied {
+        peer_name: String,
+        track_count: usize,
+        playlist_count: usize,
+    },
     P2pPeerSyncFailed {
         target: String,
         error: String,
@@ -152,6 +157,8 @@ pub struct GuiState {
     pub pending_peer_downloads: HashMap<String, PeerDownloadIntent>,
     pub cache_stats: CacheStats,
     pub status_message: String,
+    last_scan_indexed: usize,
+    pending_db_refresh: bool,
     watcher_slot: Arc<Mutex<Option<RecommendedWatcher>>>,
 }
 
@@ -263,6 +270,8 @@ impl GuiState {
             pending_peer_downloads: HashMap::new(),
             cache_stats,
             status_message: String::new(),
+            last_scan_indexed: 0,
+            pending_db_refresh: false,
             watcher_slot: Arc::clone(&watcher_slot),
         };
         // Populate initial UI from SQLite before background directory walking acquires DB locks.
@@ -307,10 +316,15 @@ impl GuiState {
                 let found = client_clone
                     .discover_lan_peers(Duration::from_millis(900))
                     .await;
+                let mut synced_ids: HashSet<String> =
+                    found.iter().map(|t| t.node_id.clone()).collect();
                 if !found.is_empty() {
                     let _ = p2p_tx.send(AsyncEvent::P2pLanDiscovered(found));
                 }
                 for peer in existing_peers {
+                    if !synced_ids.insert(peer.node_id.clone()) {
+                        continue;
+                    }
                     let ticket = PeerTicket {
                         node_id: peer.node_id.clone(),
                         node_name: peer.node_name.clone(),
@@ -333,7 +347,25 @@ impl GuiState {
     }
 
     pub fn refresh_from_db(&mut self) -> Result<()> {
-        let guard = self.db.lock().expect("db mutex poisoned");
+        let db = Arc::clone(&self.db);
+        let guard = db.lock().expect("db mutex poisoned");
+        self.refresh_from_db_with_guard(&guard)
+    }
+
+    pub fn try_refresh_from_db(&mut self) -> Result<bool> {
+        let db = Arc::clone(&self.db);
+        let res = match db.try_lock() {
+            Ok(guard) => {
+                self.refresh_from_db_with_guard(&guard)?;
+                Ok(true)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("db mutex poisoned"),
+        };
+        res
+    }
+
+    fn refresh_from_db_with_guard(&mut self, guard: &Database) -> Result<()> {
         self.tracks = guard.list_tracks(2000, 0)?;
         self.search_results = if self.search_query.trim().is_empty() {
             self.tracks.clone()
@@ -354,15 +386,27 @@ impl GuiState {
         }
         self.pinned_tracks = guard.list_pinned_tracks()?;
         self.peer_tracks = guard.list_peer_tracks(2000)?;
-        self.cache_stats = self.cache.stats(&guard)?;
+        self.cache_stats = self.cache.stats(guard)?;
         Ok(())
     }
 
     pub fn poll_async_events(&mut self) {
         let mut need_refresh = false;
         if self.scan_rx.has_changed().unwrap_or(false) {
-            let _ = self.scan_rx.borrow_and_update();
-            need_refresh = true;
+            let status = self.scan_rx.borrow_and_update().clone();
+            match status {
+                ScanStatus::Scanning { indexed, .. } => {
+                    if indexed != self.last_scan_indexed {
+                        self.last_scan_indexed = indexed;
+                        need_refresh = true;
+                    }
+                }
+                ScanStatus::Completed { indexed, .. } => {
+                    self.last_scan_indexed = indexed;
+                    need_refresh = true;
+                }
+                ScanStatus::Idle | ScanStatus::Error(_) => {}
+            }
         }
         if self.torrent_searching {
             self.torrent_search_ticks = (self.torrent_search_ticks + 0.04) % 1.0;
@@ -476,11 +520,52 @@ impl GuiState {
                     }
                 }
                 AsyncEvent::P2pPeerSynced { peer, catalog } => {
-                    if let Err(e) = self.apply_synced_peer(peer, catalog) {
-                        self.push_p2p_log(format!("[ERR] P2P sync save failed: {e}"));
-                    } else {
-                        need_refresh = true;
-                    }
+                    let peer = upsert_paired_peer_entry(&mut self.paired_peers, peer);
+                    let (tracks_with_ids, playlists) = prepare_peer_catalog_payload(&catalog);
+                    let track_count = tracks_with_ids.len();
+                    let playlist_count = playlists.len();
+                    let db = Arc::clone(&self.db);
+                    let peers_snapshot = self.paired_peers.clone();
+                    let tx = self.async_tx.clone();
+                    let peer_name = peer.node_name;
+                    tokio::task::spawn_blocking(move || {
+                        let res = match db.lock() {
+                            Ok(guard) => guard.apply_peer_catalog_tx(
+                                &peers_snapshot,
+                                &tracks_with_ids,
+                                &playlists,
+                            ),
+                            Err(_) => Err(anyhow::anyhow!("db mutex poisoned")),
+                        };
+                        match res {
+                            Ok(_) => {
+                                let _ = tx.send(AsyncEvent::P2pPeerSyncApplied {
+                                    peer_name,
+                                    track_count,
+                                    playlist_count,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AsyncEvent::P2pPeerSyncFailed {
+                                    target: peer_name,
+                                    error: e.to_string(),
+                                });
+                            }
+                        }
+                    });
+                }
+                AsyncEvent::P2pPeerSyncApplied {
+                    peer_name,
+                    track_count,
+                    playlist_count,
+                } => {
+                    let ok_msg = format!(
+                        "[OK] Peer '{}' synced: {} tracks, {} playlists",
+                        peer_name, track_count, playlist_count
+                    );
+                    self.push_p2p_log(ok_msg.clone());
+                    self.status_message = ok_msg;
+                    need_refresh = true;
                 }
                 AsyncEvent::P2pPeerSyncFailed { target, error } => {
                     let safe_target = sanitize_display_text(&redact_url_secrets(&target));
@@ -552,6 +637,7 @@ impl GuiState {
             for t in &self.active_torrents {
                 if t.finished && !self.synced_torrent_hashes.contains(&t.info_hash) {
                     self.synced_torrent_hashes.insert(t.info_hash.clone());
+                    let mut torrent_tracks: Vec<(Track, PathBuf, u64)> = Vec::new();
                     for f in &t.files {
                         if f.full_path.exists() && is_supported_audio(&f.full_path) {
                             let mut tr = extract_track_metadata(&f.full_path).unwrap_or_else(|_| Track {
@@ -576,18 +662,27 @@ impl GuiState {
                                 file_index: f.index,
                                 cached_path: Some(f.full_path.to_string_lossy().to_string()),
                             };
-                            if let Ok(guard) = self.db.lock() {
-                                if let Ok(tid) = guard.upsert_track(&tr) {
+                            torrent_tracks.push((tr, f.full_path.clone(), f.length));
+                        }
+                    }
+                    if !torrent_tracks.is_empty() {
+                        let tracks_only: Vec<Track> =
+                            torrent_tracks.iter().map(|(tr, _, _)| tr.clone()).collect();
+                        if let Ok(guard) = self.db.lock() {
+                            if let Ok(ids) = guard.upsert_tracks_batch(&tracks_only) {
+                                for (tid, (tr, full_path, len)) in
+                                    ids.into_iter().zip(torrent_tracks.iter())
+                                {
                                     let _ = self.cache.register_torrent_file(
                                         &guard,
                                         Some(tid),
                                         &tr.source.unique_key(),
-                                        &f.full_path,
-                                        f.length,
+                                        full_path,
+                                        *len,
                                         false,
                                     );
-                                    need_refresh = true;
                                 }
+                                need_refresh = true;
                             }
                         }
                     }
@@ -681,8 +776,12 @@ impl GuiState {
             }
         }
 
-        if need_refresh {
-            let _ = self.refresh_from_db();
+        if need_refresh || self.pending_db_refresh {
+            match self.try_refresh_from_db() {
+                Ok(true) => self.pending_db_refresh = false,
+                Ok(false) => self.pending_db_refresh = true,
+                Err(_) => self.pending_db_refresh = false,
+            }
         }
         self.sync_web_player_snapshot();
     }
@@ -1011,6 +1110,9 @@ impl GuiState {
     }
 
     pub fn trigger_rescan(&self) {
+        if matches!(*self.scan_rx.borrow(), ScanStatus::Scanning { .. }) {
+            return;
+        }
         spawn_home_scan(
             self.scan_root.clone(),
             Arc::clone(&self.db),
@@ -1266,65 +1368,17 @@ impl GuiState {
 
     pub fn apply_synced_peer(
         &mut self,
-        mut peer: PairedPeer,
+        peer: PairedPeer,
         catalog: RemoteCatalogDto,
     ) -> Result<()> {
-        peer.node_name = sanitize_display_text(&peer.node_name);
-        if let Some(existing) = self
-            .paired_peers
-            .iter_mut()
-            .find(|p| p.node_id == peer.node_id)
-        {
-            *existing = peer.clone();
-        } else {
-            self.paired_peers.push(peer.clone());
-        }
-
-        let clean_node_name = sanitize_display_text(&catalog.node_name);
-        let track_count = catalog.tracks.len().min(5000);
-        let playlist_count = catalog.playlists.len().min(100);
+        let peer = upsert_paired_peer_entry(&mut self.paired_peers, peer);
+        let (tracks_with_ids, playlists) = prepare_peer_catalog_payload(&catalog);
+        let track_count = tracks_with_ids.len();
+        let playlist_count = playlists.len();
 
         {
             let guard = self.db.lock().expect("db mutex poisoned");
-            guard.save_paired_peers(&self.paired_peers)?;
-
-            let mut remote_to_local: HashMap<i64, i64> = HashMap::new();
-            for rt in catalog.tracks.iter().take(5000) {
-                let track = Track {
-                    id: 0,
-                    title: sanitize_display_text(&rt.title),
-                    artist: sanitize_display_text(&rt.artist),
-                    album: sanitize_display_text(&rt.album),
-                    year: rt.year,
-                    track_number: rt.track_number,
-                    duration_secs: rt.duration_secs,
-                    file_size_bytes: rt.file_size_bytes,
-                    format: sanitize_display_text(&rt.format),
-                    cover_path: None,
-                    source: TrackSource::Peer {
-                        node_id: catalog.node_id.clone(),
-                        node_name: clean_node_name.clone(),
-                        remote_track_id: rt.id,
-                        cached_path: None,
-                    },
-                    pinned: false,
-                };
-                if let Ok(local_id) = guard.upsert_track(&track) {
-                    remote_to_local.insert(rt.id, local_id);
-                }
-            }
-
-            for rpl in catalog.playlists.iter().take(100) {
-                let clean_pl = sanitize_display_text(&rpl.name);
-                let pl_name = format!("[P2P: {clean_node_name}] {clean_pl}");
-                if let Ok(local_pl_id) = guard.create_playlist(&pl_name) {
-                    for remote_tid in &rpl.track_ids {
-                        if let Some(&local_tid) = remote_to_local.get(remote_tid) {
-                            let _ = guard.add_track_to_playlist(local_pl_id, local_tid);
-                        }
-                    }
-                }
-            }
+            guard.apply_peer_catalog_tx(&self.paired_peers, &tracks_with_ids, &playlists)?;
         }
 
         self.refresh_from_db()?;
@@ -1410,4 +1464,67 @@ impl GuiState {
             }
         });
     }
+}
+
+fn upsert_paired_peer_entry(
+    paired_peers: &mut Vec<PairedPeer>,
+    mut peer: PairedPeer,
+) -> PairedPeer {
+    peer.node_name = sanitize_display_text(&peer.node_name);
+    if let Some(existing) = paired_peers.iter_mut().find(|p| p.node_id == peer.node_id) {
+        *existing = peer.clone();
+    } else {
+        paired_peers.push(peer.clone());
+    }
+    peer
+}
+
+fn prepare_peer_catalog_payload(
+    catalog: &RemoteCatalogDto,
+) -> (Vec<(i64, Track)>, Vec<(String, Vec<i64>)>) {
+    let clean_node_name = sanitize_display_text(&catalog.node_name);
+    let tracks_with_ids = catalog
+        .tracks
+        .iter()
+        .take(5000)
+        .map(|rt| {
+            (
+                rt.id,
+                Track {
+                    id: 0,
+                    title: sanitize_display_text(&rt.title),
+                    artist: sanitize_display_text(&rt.artist),
+                    album: sanitize_display_text(&rt.album),
+                    year: rt.year,
+                    track_number: rt.track_number,
+                    duration_secs: rt.duration_secs,
+                    file_size_bytes: rt.file_size_bytes,
+                    format: sanitize_display_text(&rt.format),
+                    cover_path: None,
+                    source: TrackSource::Peer {
+                        node_id: catalog.node_id.clone(),
+                        node_name: clean_node_name.clone(),
+                        remote_track_id: rt.id,
+                        cached_path: None,
+                    },
+                    pinned: false,
+                },
+            )
+        })
+        .collect();
+
+    let playlists = catalog
+        .playlists
+        .iter()
+        .take(100)
+        .map(|rpl| {
+            let clean_pl = sanitize_display_text(&rpl.name);
+            (
+                format!("[P2P: {clean_node_name}] {clean_pl}"),
+                rpl.track_ids.clone(),
+            )
+        })
+        .collect();
+
+    (tracks_with_ids, playlists)
 }
